@@ -21,7 +21,7 @@ Trace combines repository search, function and symbol extraction, structured HTM
 # How Trace Works
 
 ```text
-Problem statement
+Problem statement + Function index
       ↓
 AI decides what evidence it needs
       ↓
