@@ -1,0 +1,4280 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+# AI context trace for terminal workflows, search/extract → accumulate context → copy to clipboard.
+
+usage() {
+  cat <<'EOF'
+Usage:
+  trace <pattern> [path...]
+#   trace --all <pattern> [path...]
+  trace --context <N> <pattern> [path...]
+  trace --symbol <file> <symbol>
+  trace <start> <end> <file> [label...]
+  trace --replace <start> <end> <file> <expected-label>
+  trace --snapshot <file-or-dir>
+  trace --diff <before> <after>
+  trace --diff-symbol <before-file> <after-file> <symbol>
+  trace -jq <file> <filter>
+  trace --clear
+  trace --functions <file> [symbol]
+  trace --help
+  trace -h
+
+Examples:
+
+  trace variable /dir/proj
+  trace --all VAR
+  trace --diff old/trace_state.py new/trace_state.py
+  trace --diff /path/to/before-repo /path/to/after-repo
+  trace --diff-symbol \
+  /root/rgui/trace_old/trace_state.py \
+  /root/rgui/trace_new/trace_state.py \
+  build_state
+  trace --diff-symbol \
+    /root/rgui/trace_old/trace_state.py \
+    /root/rgui/trace_new/state/trace_state.py \
+    build_state
+  trace --diff-symbol \
+    /root/rgui/tracez_v_287_before_suffciency_prompt/trace \
+    /root/rgui/trace \
+    trace_run_repo_diff
+  trace --diff-symbol old/trace_state.py new/trace_state.py build_state
+  trace -jq events.jsonl 'select(.round == 14) | {round,type,message}'
+  trace --context 25 Cancel trace-ui.html
+  trace --context 40 progress-label trace-ui.html
+  trace --symbol trace-ui.html renderRun
+  trace --symbol trace-agent1.py run_trace
+  trace 500 635 file.cs HandleSetupHotkeys
+  trace --replace 122 166 server.py _log_request_start
+  sed -n '500,635p' file.cs | trace HandleSetupHotkeys
+  trace --clear
+  trace --functions ./app.py
+  trace --functions ./UserService.cs SaveUser
+  trace --html-id <file> <id>
+  trace --html-class <file> <class>
+  trace --html-tag <file> <tag>
+  trace --css <file> <selector>
+  trace --json-path <file> <path>
+  trace --yaml-path <file> <path>
+  trace --heading <file> <heading>
+# --html-id adds one context line before/after. That is okay.
+# --html-class returns first match only. That is okay for v1.
+# #CSS block extraction from inline CSS in trace-ui.html works.
+# HTML id extraction works.
+# HTML class extraction works.
+# JS symbol extraction still works.
+# JSON path extraction works.
+
+Comparison:
+   trace --diff <before> <after>
+       Compare files or repositories.
+       Direction is always BEFORE -> AFTER.
+       Repository mode returns a changed-file manifest plus complete
+       unified diff hunks for every changed file.
+  trace --diff-symbol <before-file> <after-file> <symbol>
+      Resolve the symbol independently in BEFORE and AFTER and diff
+      only the resolved symbol slices.
+      Symbols may move to different line numbers between versions.
+      Supported:
+        Python
+        JS / JSX / TS / TSX / HTML
+        sh / bash / zsh / trace
+      Missing or ambiguous symbols fail closed.
+Structured JSON / JSONL:
+  trace -jq <file> <filter>
+      Run a jq filter over JSON or JSONL.
+      Returns every complete compact JSON result.
+      Timeout guard:
+        TRACE_JQ_TIMEOUT_SECONDS=10
+Modes:
+  trace --context  Extract around matches with rg -C and append to context
+  trace --symbol   Extract a whole function/task by symbol without editing
+  trace --snapshot .
+  trace --snapshot ./src
+  trace --snapshot /full/path/to/file.py
+  default     Search smart project files only
+  --all       Search all non-ignored files from type_filters
+  range       Extract line range from file
+  --replace   Replace exact line range after pasted reviewed code
+  stdin       Capture piped input automatically
+Notes:
+  - Latest clean output: ~/.cache/trace/buffer.txt
+  - AI context history:   ~/.cache/trace/context.txt
+  - Copies to tmux/clipboard when available
+EOF
+}
+
+
+trace_print_footer() {
+  local copy_target="$1"
+  local context_file="$2"
+  local added_lines="${3:-0}"
+  local label="${4:-}"
+
+  local context_lines
+  local context_bytes
+  local footer
+
+  context_lines=$(wc -l < "$context_file" | tr -d ' ')
+  context_bytes=$(wc -c < "$context_file" | tr -d ' ')
+
+  footer="${added_lines}|${context_lines}|${context_bytes}|${copy_target}|${label}"
+
+  trace_emit_footer "$footer"
+}
+
+trace_emit_footer() {
+  local footer="$1"
+
+  if [[ "${TRACE_DELAY_FOOTER:-0}" != "1" ]]; then
+    local added_lines context_lines context_bytes copy_target label
+
+    IFS='|' read -r added_lines context_lines context_bytes copy_target label <<< "$footer"
+
+    print -r -- ""
+    if [[ -n "$label" ]]; then
+      print -r -- "[trace] ${label} +${added_lines}L → context ${context_lines}L / ${context_bytes}B copied to ${copy_target}"
+    else
+      print -r -- "[trace] +${added_lines}L → context ${context_lines}L / ${context_bytes}B copied to ${copy_target}"
+    fi
+    return
+  fi
+
+  local buffer_dir="${TRACE_BUFFER_DIR:-$HOME/.cache/trace}"
+  local footer_queue="${buffer_dir}/footer_queue.txt"
+  local footer_lock="${buffer_dir}/footer_queue.lock"
+
+  mkdir -p "$buffer_dir"
+  print -r -- "$footer" >> "$footer_queue"
+
+  (
+    exec 9>"$footer_lock"
+
+    if ! flock -n 9; then
+      exit 0
+    fi
+
+    sleep 1.0
+
+    if [[ -s "$footer_queue" ]]; then
+      local count total_added last_context_lines last_context_bytes last_copy_target
+      count=$(wc -l < "$footer_queue" | tr -d ' ')
+      total_added=0
+
+      while IFS='|' read -r added_lines context_lines context_bytes copy_target label; do
+        total_added=$((total_added + added_lines))
+        last_context_lines="$context_lines"
+        last_context_bytes="$context_bytes"
+        last_copy_target="$copy_target"
+      done < "$footer_queue"
+
+      print -r -- ""
+      print -r -- "[trace] appended ${count} blocks / +${total_added}L → context ${last_context_lines}L / ${last_context_bytes}B copied to ${last_copy_target}"
+
+      while IFS='|' read -r added_lines context_lines context_bytes copy_target label; do
+        if [[ -n "$label" ]]; then
+          print -r -- "  +${added_lines}L  ${label}"
+        else
+          print -r -- "  +${added_lines}L"
+        fi
+      done < "$footer_queue"
+
+      : > "$footer_queue"
+    fi
+  ) &
+}
+
+trace_detect_symbol_name() {
+  local file="$1"
+  local start_line="$2"
+
+  awk -v start="$start_line" '
+    NR > start { exit }
+
+    /^[[:space:]]*def[[:space:]]+/ ||
+    /^[[:space:]]*async[[:space:]]+def[[:space:]]+/ ||
+    /^[[:space:]]*function[[:space:]]+/ ||
+    /^[[:space:]]*(public|private|protected|internal|static|async)/ {
+
+      line=$0
+      sub(/^[[:space:]]*/, "", line)
+
+      sig=line
+    }
+
+    END {
+      print sig
+    }
+  ' "$file"
+}
+
+trace_validate_file_syntax() {
+  local file="$1"
+
+  case "$file" in
+    *.py)
+      if command -v python3 >/dev/null 2>&1; then
+        python3 -m py_compile "$file"
+      elif command -v python >/dev/null 2>&1; then
+        python -m py_compile "$file"
+      else
+        print -r -- "[trace] syntax validation skipped: python not found"
+      fi
+      ;;
+
+    *.sh|*.bash)
+      if command -v bash >/dev/null 2>&1; then
+        bash -n "$file"
+      else
+        print -r -- "[trace] syntax validation skipped: bash not found"
+      fi
+      ;;
+
+    *.zsh)
+      if command -v zsh >/dev/null 2>&1; then
+        zsh -n "$file"
+      else
+        print -r -- "[trace] syntax validation skipped: zsh not found"
+      fi
+      ;;
+
+    *.yml|*.yaml)
+      if command -v python3 >/dev/null 2>&1; then
+        python3 - <<PY
+import sys, yaml
+with open("$file", "r", encoding="utf-8") as f:
+    yaml.safe_load(f)
+PY
+      else
+        print -r -- "[trace] syntax validation skipped: python3 not found"
+      fi
+      ;;
+
+    *)
+      print -r -- "[trace] syntax validation skipped for file type: $file"
+      ;;
+  esac
+}
+
+trace_resolve_python_function_range() {
+  local file="$1"
+  local symbol="$2"
+
+  awk -v sym="$symbol" '
+    function lead(s, t) {
+      t = s
+      sub(/[^ \t].*$/, "", t)
+      return length(t)
+    }
+
+    function blank(s) {
+      return s ~ /^[ \t]*$/
+    }
+
+    function comment(s) {
+      return s ~ /^[ \t]*#/
+    }
+
+    function header_complete(s) {
+      return s ~ /:[ \t]*(#.*)?$/
+    }
+
+    {
+      lines[NR] = $0
+    }
+
+    END {
+      def_line = 0
+      pattern = "^[ \t]*(async[ \t]+)?def[ \t]+" sym "[ \t]*\\("
+
+      for (i = 1; i <= NR; i++) {
+        if (lines[i] ~ pattern) {
+          if (def_line != 0) {
+            print "MULTIPLE"
+            exit
+          }
+
+          def_line = i
+        }
+      }
+
+      if (def_line == 0) {
+        print "NONE"
+        exit
+      }
+
+      start = def_line
+
+      for (i = def_line - 1; i >= 1; i--) {
+        if (lines[i] ~ /^[ \t]*@/) {
+          start = i
+        } else {
+          break
+        }
+      }
+
+      base_indent = lead(lines[def_line])
+      end = NR
+      in_header = !header_complete(lines[def_line])
+      body_seen = 0
+
+      for (i = def_line + 1; i <= NR; i++) {
+        if (in_header) {
+          if (header_complete(lines[i])) {
+            in_header = 0
+          }
+          continue
+        }
+
+        if (blank(lines[i]) || comment(lines[i])) {
+          continue
+        }
+
+        if (lead(lines[i]) <= base_indent) {
+          if (body_seen) {
+            end = i - 1
+            break
+          }
+
+          continue
+        }
+
+        body_seen = 1
+      }
+
+      while (end > def_line && blank(lines[end])) {
+        end--
+      }
+
+      print start " " end
+    }
+  ' "$file"
+}
+
+trace_resolve_js_ts_function_range() {
+  local file="$1"
+  local symbol="$2"
+
+  awk -v sym="$symbol" '
+    function trim(s) {
+      sub(/^[ \t]*/, "", s)
+      sub(/[ \t]*$/, "", s)
+      return s
+    }
+
+    function is_match(line) {
+      t = trim(line)
+
+      if (t ~ "^(async[ \t]+)?function[ \t]+" sym "[ \t]*\\(") return 1
+      if (t ~ "^(export[ \t]+)?(async[ \t]+)?function[ \t]+" sym "[ \t]*\\(") return 1
+      if (t ~ "^(export[ \t]+)?(const|let|var)[ \t]+" sym "[ \t]*=[ \t]*(async[ \t]*)?\\(") return 1
+      if (t ~ "^(export[ \t]+)?(const|let|var)[ \t]+" sym "[ \t]*=[ \t]*(async[ \t]*)?[A-Za-z0-9_$]+[ \t]*=>") return 1
+      if (t ~ "^(export[ \t]+)?(const|let|var)[ \t]+" sym "[ \t]*=[ \t]*(async[ \t]*)?function[ \t]*\\(") return 1
+
+      return 0
+    }
+
+    {
+      lines[NR] = $0
+    }
+
+    END {
+      start = 0
+
+      for (i = 1; i <= NR; i++) {
+        if (is_match(lines[i])) {
+          if (start != 0) {
+            print "MULTIPLE"
+            exit
+          }
+          start = i
+        }
+      }
+
+      if (start == 0) {
+        print "NONE"
+        exit
+      }
+
+      brace_seen = 0
+      depth = 0
+      end = NR
+
+      for (i = start; i <= NR; i++) {
+        line = lines[i]
+
+        for (j = 1; j <= length(line); j++) {
+          ch = substr(line, j, 1)
+
+          if (ch == "{") {
+            depth++
+            brace_seen = 1
+          } else if (ch == "}") {
+            depth--
+          }
+        }
+
+        if (brace_seen && depth <= 0) {
+          end = i
+          break
+        }
+      }
+
+      print start " " end
+    }
+  ' "$file"
+}
+
+trace_resolve_csharp_function_range() {
+  local file="$1"
+  local symbol="$2"
+
+  awk -v sym="$symbol" '
+    function trim(s) {
+      sub(/^[ \t]*/, "", s)
+      sub(/[ \t]*$/, "", s)
+      return s
+    }
+
+    function is_match(line) {
+      t = trim(line)
+
+      if (t ~ "^(public|private|protected|internal|static|virtual|override|sealed|async|partial|extern|new)[ \t]+.*[ \t]+" sym "[ \t]*\\(") return 1
+      if (t ~ "^[A-Za-z0-9_<>,\\[\\]?]+[ \t]+" sym "[ \t]*\\(") return 1
+
+      return 0
+    }
+
+    {
+      lines[NR] = $0
+    }
+
+    END {
+      start = 0
+
+      for (i = 1; i <= NR; i++) {
+        if (is_match(lines[i])) {
+          if (start != 0) {
+            print "MULTIPLE"
+            exit
+          }
+          start = i
+        }
+      }
+
+      if (start == 0) {
+        print "NONE"
+        exit
+      }
+
+      for (i = start - 1; i >= 1; i--) {
+        if (lines[i] ~ /^[ \t]*\[/) {
+          start = i
+        } else if (lines[i] ~ /^[ \t]*$/) {
+          continue
+        } else {
+          break
+        }
+      }
+
+      brace_seen = 0
+      depth = 0
+      end = NR
+
+      for (i = start; i <= NR; i++) {
+        line = lines[i]
+
+        for (j = 1; j <= length(line); j++) {
+          ch = substr(line, j, 1)
+
+          if (ch == "{") {
+            depth++
+            brace_seen = 1
+          } else if (ch == "}") {
+            depth--
+          }
+        }
+
+        if (brace_seen && depth <= 0) {
+          end = i
+          break
+        }
+      }
+
+      print start " " end
+    }
+  ' "$file"
+}
+
+
+
+
+trace_resolve_ansible_task_range() {
+  local file="$1"
+  local symbol="$2"
+
+  awk -v sym="$symbol" '
+    {
+      lines[NR] = $0
+    }
+
+    END {
+      start = 0
+
+      for (i = 1; i <= NR; i++) {
+        line = lines[i]
+
+        if (line ~ /^[ \t]*-[ \t]+name:[ \t]*/) {
+          name = line
+          sub(/^[ \t]*-[ \t]+name:[ \t]*/, "", name)
+          gsub(/^["'\''"]|["'\''"]$/, "", name)
+
+          if (index(tolower(name), tolower(sym)) > 0) {
+            if (start != 0) {
+              print "MULTIPLE"
+              exit
+            }
+            start = i
+          }
+        }
+      }
+
+      if (start == 0) {
+        print "NONE"
+        exit
+      }
+
+      end = NR
+
+      for (i = start + 1; i <= NR; i++) {
+        if (lines[i] ~ /^[ \t]*-[ \t]+name:[ \t]*/) {
+          end = i - 1
+          break
+        }
+      }
+
+      while (end > start && lines[end] ~ /^[ \t]*$/) {
+        end--
+      }
+
+      print start " " end
+    }
+  ' "$file"
+}
+
+
+trace_resolve_shell_function_range() {
+  local file="$1"
+  local symbol="$2"
+
+  awk -v sym="$symbol" '
+    function trim(s) {
+      sub(/^[ \t]*/, "", s)
+      sub(/[ \t]*$/, "", s)
+      return s
+    }
+
+    function blank(s) {
+      return s ~ /^[ \t]*$/
+    }
+
+    function is_target_def(line) {
+      t = trim(line)
+
+      if (t ~ "^" sym "[ \t]*\\(\\)[ \t]*(\\{|$)") return 1
+      if (t ~ "^function[ \t]+" sym "([ \t]*\\(\\))?[ \t]*(\\{|$)") return 1
+
+      return 0
+    }
+
+    function is_any_shell_def(line) {
+      t = trim(line)
+
+      if (t ~ "^[A-Za-z_][A-Za-z0-9_]*[ \t]*\\(\\)[ \t]*(\\{|$)") return 1
+      if (t ~ "^function[ \t]+[A-Za-z_][A-Za-z0-9_]*([ \t]*\\(\\))?[ \t]*(\\{|$)") return 1
+
+      return 0
+    }
+
+    {
+      lines[NR] = $0
+    }
+
+    END {
+      start = 0
+
+      for (i = 1; i <= NR; i++) {
+        if (is_target_def(lines[i])) {
+          if (start != 0) {
+            print "MULTIPLE"
+            exit
+          }
+
+          start = i
+        }
+      }
+
+      if (start == 0) {
+        print "NONE"
+        exit
+      }
+
+      end = NR
+
+      for (i = start + 1; i <= NR; i++) {
+        if (lines[i] ~ /^}[ \t]*(#.*)?$/) {
+          end = i
+          break
+        }
+
+        if (is_any_shell_def(lines[i])) {
+          end = i - 1
+          break
+        }
+      }
+
+      while (end > start && blank(lines[end])) {
+        end--
+      }
+
+      print start " " end
+    }
+  ' "$file"
+}
+
+
+trace_extract_html_attr_block() {
+  local mode="$1"
+  local target_file="$2"
+  local query="$3"
+  local buffer_file="$4"
+  local meta_file="$5"
+
+  awk -v mode="$mode" -v query="$query" -v meta_file="$meta_file" '
+    function is_void_tag(tag) {
+      return tag ~ /^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/
+    }
+
+    function tag_name(line, value) {
+      if (match(line, /<[[:alpha:]][[:alnum:]_:-]*/)) {
+        value = substr(line, RSTART + 1, RLENGTH - 1)
+        return tolower(value)
+      }
+
+      return ""
+    }
+
+    function target_line(line) {
+      if (mode == "html-id") {
+        return line ~ /id[ \t]*=/ && index(line, query) > 0
+      }
+
+      if (mode == "html-class") {
+        return line ~ /class[ \t]*=/ && line ~ ("(^|[^A-Za-z0-9_-])" query "([^A-Za-z0-9_-]|$)")
+      }
+
+      return 0
+    }
+
+    function count_regex(line, pattern, tmp) {
+      tmp = line
+      return gsub(pattern, "", tmp)
+    }
+
+    {
+      lines[NR] = $0
+    }
+
+    END {
+      hit = 0
+
+      for (i = 1; i <= NR; i++) {
+        if (target_line(lines[i])) {
+          hit = i
+          break
+        }
+      }
+
+      if (hit == 0) {
+        print "[trace] " mode " not found: " query > "/dev/stderr"
+        exit 1
+      }
+
+      start = hit
+
+      while (start > 1 && lines[start] !~ /<[[:alpha:]][[:alnum:]_:-]*/) {
+        start--
+      }
+
+      tag = tag_name(lines[start])
+
+      if (tag == "") {
+        end = hit
+      } else if (is_void_tag(tag) || lines[hit] ~ /\/>/) {
+        end = hit
+      } else {
+        depth = 0
+        end = hit
+        open_pattern = "<" tag "([ \t>/]|$)"
+        close_pattern = "</" tag ">"
+
+        for (i = start; i <= NR; i++) {
+          opens = count_regex(lines[i], open_pattern)
+          closes = count_regex(lines[i], close_pattern)
+          depth += opens - closes
+
+          if (i >= hit && closes > 0 && depth <= 0) {
+            end = i
+            break
+          }
+
+          if (i >= hit) {
+            end = i
+          }
+        }
+      }
+
+      pad_start = start > 1 ? start - 1 : start
+      pad_end = end < NR ? end + 1 : end
+
+      print "lines: " pad_start "-" pad_end > meta_file
+      print "label: " mode ":" query >> meta_file
+
+      for (i = pad_start; i <= pad_end; i++) {
+        print lines[i]
+      }
+    }
+  ' "$target_file" > "$buffer_file"
+}
+trace_extract_html_tag_boundaries() {
+  local target_file="$1"
+  local query="$2"
+  local buffer_file="$3"
+  local meta_file="$4"
+
+  if [[ ! "$query" =~ '^[A-Za-z][A-Za-z0-9:_-]*$' ]]; then
+    print -r -- "[trace] invalid HTML tag: $query" >&2
+    return 1
+  fi
+  awk \
+    -v query="$query" \
+    -v meta_file="$meta_file" '
+    function count_regex(line, pattern, tmp) {
+      tmp = line
+      return gsub(pattern, "", tmp)
+    }
+
+    function is_void_tag(tag) {
+      return tag ~ /^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/
+    }
+
+    BEGIN {
+      tag = tolower(query)
+      open_pattern = "<" tag "([ \t>/]|$)"
+      close_pattern = "</" tag "[ \t]*>"
+      total_matches = 0
+    }
+    {
+      lines[NR] = $0
+      normalized = tolower($0)
+      opens = count_regex(normalized, open_pattern)
+
+      if (opens <= 0) {
+        next
+      }
+      total_matches += opens
+
+      for (occurrence = 1; occurrence <= opens; occurrence++) {
+        opening_lines[total_matches - opens + occurrence] = NR
+      }
+    }
+
+    END {
+      if (total_matches == 0) {
+        print "[trace] html-tag not found: " tag > "/dev/stderr"
+        exit 1
+      }
+
+      print "matches: " total_matches > meta_file
+      print "label: html-tag:" tag >> meta_file
+
+
+      if (total_matches != 1) {
+        for (match_index = 1; match_index <= total_matches; match_index++) {
+          line_number = opening_lines[match_index]
+
+          print "match " match_index ":"
+          print "opening_line: " line_number
+          print lines[line_number]
+        }
+
+        exit 0
+      }
+
+      start = opening_lines[1]
+      end = start
+      normalized_start = tolower(lines[start])
+
+      if (is_void_tag(tag) || normalized_start ~ /\/[ \t]*>/) {
+        end = start
+      } else {
+        depth = 0
+        boundary_found = 0
+
+        for (line_index = start; line_index <= NR; line_index++) {
+          normalized = tolower(lines[line_index])
+          opens = count_regex(normalized, open_pattern)
+          closes = count_regex(normalized, close_pattern)
+          depth += opens - closes
+
+          if (closes > 0 && depth <= 0) {
+            end = line_index
+            boundary_found = 1
+            break
+          }
+        }
+
+        if (!boundary_found) {
+          print "[trace] html-tag has no complete closing boundary: " tag > "/dev/stderr"
+          exit 1
+        }
+      }
+
+      print "match 1:"
+      print "opening_line: " start
+      print lines[start]
+      print "closing_line: " end
+
+      if (end != start) {
+        print lines[end]
+      }
+    }
+  ' "$target_file" > "$buffer_file"
+}
+
+trace_extract_css_block() {
+  local target_file="$1"
+  local selector="$2"
+  local buffer_file="$3"
+  local meta_file="$4"
+
+  awk -v selector="$selector" -v meta_file="$meta_file" '
+    function trim(value) {
+      gsub(/^[ \t]+|[ \t]+$/, "", value)
+      return value
+    }
+
+    function count_open(line, tmp) {
+      tmp = line
+      return gsub(/\{/, "", tmp)
+    }
+
+    function count_close(line, tmp) {
+      tmp = line
+      return gsub(/\}/, "", tmp)
+    }
+
+    {
+      lines[NR] = $0
+    }
+
+    END {
+      for (i = 1; i <= NR; i++) {
+        line = trim(lines[i])
+
+        if (index(line, selector) == 0) {
+          continue
+        }
+
+        if (line ~ /^</ || line ~ /=/) {
+          continue
+        }
+
+        brace_line = 0
+
+        for (j = i; j <= NR; j++) {
+          candidate = trim(lines[j])
+
+          if (candidate ~ /^</) {
+            break
+          }
+
+          if (index(candidate, "{") > 0) {
+            brace_line = j
+            break
+          }
+
+          if (index(candidate, "}") > 0 || index(candidate, ";") > 0) {
+            break
+          }
+        }
+
+        if (brace_line == 0) {
+          continue
+        }
+
+        start = i
+
+        while (start > 1) {
+          previous = trim(lines[start - 1])
+
+          if (previous == "" || previous ~ /^</ || previous ~ /[{};]/) {
+            break
+          }
+
+          if (previous ~ /,$/) {
+            start--
+            continue
+          }
+
+          break
+        }
+
+        depth = 0
+        end = brace_line
+
+        for (j = start; j <= NR; j++) {
+          depth += count_open(lines[j]) - count_close(lines[j])
+
+          if (j >= brace_line && depth <= 0) {
+            end = j
+            break
+          }
+        }
+
+        print "lines: " start "-" end > meta_file
+        print "label: css:" selector >> meta_file
+
+        for (j = start; j <= end; j++) {
+          print lines[j]
+        }
+
+        exit 0
+      }
+
+      print "[trace] CSS selector not found: " selector > "/dev/stderr"
+      exit 1
+    }
+  ' "$target_file" > "$buffer_file"
+}
+
+trace_extract_json_path() {
+  local target_file="$1"
+  local json_path="$2"
+  local buffer_file="$3"
+  local meta_file="$4"
+
+  if ! command -v jq >/dev/null 2>&1; then
+    print -r -- "[trace] --json-path requires jq" >&2
+    return 1
+  fi
+
+  local jq_expr="$json_path"
+
+  if [[ "$jq_expr" != .* ]] && [[ "$jq_expr" != \[* ]]; then
+    jq_expr=".$jq_expr"
+  fi
+
+  if ! jq -M "$jq_expr" "$target_file" > "$buffer_file"; then
+    print -r -- "[trace] JSON path failed: $json_path" >&2
+    return 1
+  fi
+
+  print -r -- "label: json-path:$json_path" > "$meta_file"
+}
+trace_extract_jq_query() {
+  local target_file="$1"
+  local jq_query="$2"
+  local buffer_file="$3"
+  local meta_file="$4"
+
+  local jq_cmd=""
+  jq_cmd="$(whence -p jq 2>/dev/null || true)"
+
+  if [[ -z "$jq_cmd" ]]; then
+    print -r -- "[trace] -jq requires jq" >&2
+    return 1
+  fi
+
+  local timeout_cmd=""
+  timeout_cmd="$(whence -p timeout 2>/dev/null || true)"
+
+  if [[ -z "$timeout_cmd" ]]; then
+    timeout_cmd="$(whence -p gtimeout 2>/dev/null || true)"
+  fi
+
+  if [[ -z "$timeout_cmd" ]]; then
+    print -r -- \
+      "[trace] -jq requires timeout (GNU coreutils; gtimeout on macOS)" >&2
+    return 1
+  fi
+
+  if [[ -z "$jq_query" ]]; then
+    print -r -- "[trace] -jq requires a non-empty jq filter" >&2
+    return 1
+  fi
+
+  local timeout_seconds="${TRACE_JQ_TIMEOUT_SECONDS:-10}"
+
+  if [[ ! "$timeout_seconds" =~ '^[1-9][0-9]*$' ]]; then
+    print -r -- \
+      "[trace] invalid TRACE_JQ_TIMEOUT_SECONDS: $timeout_seconds" >&2
+    return 1
+  fi
+
+  local temp_prefix="${buffer_file}.jq.$$"
+  local raw_file="${temp_prefix}.raw.tmp"
+  local error_file="${temp_prefix}.stderr.tmp"
+  local module_dir="${temp_prefix}.modules"
+
+  mkdir -p "$module_dir"
+  : > "$raw_file"
+  : > "$error_file"
+
+  # Process every input value from JSON or JSONL.
+  # There is intentionally NO item limit and NO byte limit.
+  local jq_program="inputs | (${jq_query})"
+  local jq_status=0
+
+  # Clear inherited environment so jq env/$ENV cannot expose secrets.
+  # Empty -L directory also prevents importing arbitrary jq modules.
+  env -i \
+    LC_ALL=C \
+    "$timeout_cmd" --signal=TERM --kill-after=2s "${timeout_seconds}s" \
+    "$jq_cmd" \
+      --null-input \
+      --compact-output \
+      --monochrome-output \
+      -L "$module_dir" \
+      "$jq_program" \
+      "$target_file" \
+      > "$raw_file" \
+      2> "$error_file" || jq_status=$?
+
+  if (( jq_status != 0 )); then
+    if (( jq_status == 124 || jq_status == 137 )); then
+      print -r -- \
+        "[trace] jq query timed out after ${timeout_seconds}s" >&2
+    else
+      print -r -- \
+        "[trace] jq query failed with status $jq_status" >&2
+
+      if [[ -s "$error_file" ]]; then
+        cat "$error_file" >&2
+        print -r -- "" >&2
+      fi
+    fi
+
+    rm -f -- \
+      "$raw_file" \
+      "$error_file"
+
+    rmdir -- "$module_dir" 2>/dev/null || true
+
+    return 1
+  fi
+
+  mv -- "$raw_file" "$buffer_file"
+
+  local returned_items
+  local returned_bytes
+
+  returned_items=$(wc -l < "$buffer_file" | tr -d ' ')
+  returned_bytes=$(wc -c < "$buffer_file" | tr -d ' ')
+
+  {
+    print -r -- "label: jq"
+    print -r -- "format: compact-jsonl"
+    print -r -- "returned-items: $returned_items"
+    print -r -- "returned-bytes: $returned_bytes"
+    print -r -- "timeout: ${timeout_seconds}s"
+  } > "$meta_file"
+  rm -f -- "$error_file"
+  rmdir -- "$module_dir" 2>/dev/null || true
+}
+
+trace_extract_yaml_path() {
+  local target_file="$1"
+  local yaml_path="$2"
+  local buffer_file="$3"
+  local meta_file="$4"
+
+  if ! command -v yq >/dev/null 2>&1; then
+    print -r -- "[trace] --yaml-path requires yq" >&2
+    return 1
+  fi
+
+  local yq_expr="$yaml_path"
+  if [[ "$yq_expr" != .* ]] && [[ "$yq_expr" != \[* ]]; then
+    yq_expr=".$yq_expr"
+  fi
+
+  if yq --version 2>/dev/null | grep -qi 'mikefarah'; then
+    if ! yq eval "$yq_expr" "$target_file" > "$buffer_file"; then
+      print -r -- "[trace] YAML path failed: $yaml_path" >&2
+      return 1
+    fi
+  else
+    if ! yq "$yq_expr" "$target_file" > "$buffer_file"; then
+      print -r -- "[trace] YAML path failed: $yaml_path" >&2
+      return 1
+    fi
+  fi
+
+  print -r -- "label: yaml-path:$yaml_path" > "$meta_file"
+}
+
+trace_extract_markdown_heading() {
+  local target_file="$1"
+  local heading="$2"
+  local buffer_file="$3"
+  local meta_file="$4"
+
+  awk -v heading="$heading" -v meta_file="$meta_file" '
+    function normalize(value) {
+      gsub(/^#+[ \t]*/, "", value)
+      gsub(/[ \t]*#+[ \t]*$/, "", value)
+      gsub(/[ \t]+/, " ", value)
+      gsub(/^[ \t]+|[ \t]+$/, "", value)
+      return tolower(value)
+    }
+
+    {
+      lines[NR] = $0
+    }
+
+    END {
+      wanted = normalize(heading)
+      start = 0
+      level = 0
+
+      for (i = 1; i <= NR; i++) {
+        if (lines[i] !~ /^#{1,6}[ \t]+/) {
+          continue
+        }
+
+        match(lines[i], /^#+/)
+        this_level = RLENGTH
+        title = normalize(lines[i])
+
+        if (title == wanted || index(title, wanted) > 0) {
+          start = i
+          level = this_level
+          break
+        }
+      }
+
+      if (start == 0) {
+        print "[trace] heading not found: " heading > "/dev/stderr"
+        exit 1
+      }
+
+      end = NR
+
+      for (i = start + 1; i <= NR; i++) {
+        if (lines[i] ~ /^#{1,6}[ \t]+/) {
+          match(lines[i], /^#+/)
+          this_level = RLENGTH
+
+          if (this_level <= level) {
+            end = i - 1
+            break
+          }
+        }
+      }
+
+      while (end > start && lines[end] ~ /^[ \t]*$/) {
+        end--
+      }
+
+      print "lines: " start "-" end > meta_file
+      print "label: heading:" heading >> meta_file
+
+      for (i = start; i <= end; i++) {
+        print lines[i]
+      }
+    }
+  ' "$target_file" > "$buffer_file"
+}
+trace_run_structured_extract() {
+  local mode="$1"
+  local source_label="$2"
+  local target_file="$3"
+  local query="$4"
+
+  if [[ ! -f "$target_file" ]]; then
+    print -r -- \
+      "[trace] target file not found: $target_file" >&2
+    return 1
+  fi
+
+  local buffer_dir="${TRACE_BUFFER_DIR:-$HOME/.cache/trace}"
+  local buffer_file="${TRACE_BUFFER_FILE:-$buffer_dir/buffer.txt}"
+  local context_file="${TRACE_CONTEXT_FILE:-$buffer_dir/context.txt}"
+  local counter_file="${TRACE_COUNTER_FILE:-$buffer_dir/counter.txt}"
+  local meta_file="${buffer_file}.meta.tmp"
+  local result_file="${buffer_file}.structured.$$"
+
+  mkdir -p "$buffer_dir"
+
+  : > "$meta_file"
+  : > "$result_file"
+
+  if [[ ! -f "$context_file" ]]; then
+    : > "$context_file"
+  fi
+
+  if [[ ! -f "$counter_file" ]]; then
+    print -r -- "0" > "$counter_file"
+  fi
+
+  local extract_status=0
+
+  case "$mode" in
+    html-id|html-class)
+      trace_extract_html_attr_block \
+        "$mode" \
+        "$target_file" \
+        "$query" \
+        "$result_file" \
+        "$meta_file" || extract_status=$?
+      ;;
+
+    html-tag)
+      trace_extract_html_tag_boundaries \
+        "$target_file" \
+        "$query" \
+        "$result_file" \
+        "$meta_file" || extract_status=$?
+      ;;
+
+    css)
+      trace_extract_css_block \
+        "$target_file" \
+        "$query" \
+        "$result_file" \
+        "$meta_file" || extract_status=$?
+      ;;
+
+    json-path)
+      trace_extract_json_path \
+        "$target_file" \
+        "$query" \
+        "$result_file" \
+        "$meta_file" || extract_status=$?
+      ;;
+
+    jq)
+      trace_extract_jq_query \
+        "$target_file" \
+        "$query" \
+        "$result_file" \
+        "$meta_file" || extract_status=$?
+      ;;
+
+    yaml-path)
+      trace_extract_yaml_path \
+        "$target_file" \
+        "$query" \
+        "$result_file" \
+        "$meta_file" || extract_status=$?
+      ;;
+
+    heading)
+      trace_extract_markdown_heading \
+        "$target_file" \
+        "$query" \
+        "$result_file" \
+        "$meta_file" || extract_status=$?
+      ;;
+
+    *)
+      print -r -- \
+        "[trace] unknown structured mode: $mode" >&2
+      extract_status=1
+      ;;
+  esac
+
+  if (( extract_status != 0 )); then
+    rm -f -- \
+      "$result_file" \
+      "$meta_file"
+
+    local preserved_copy_target="none"
+
+    if [[ -n "${TMUX:-}" ]] &&
+       command -v tmux >/dev/null 2>&1; then
+      tmux load-buffer "$context_file"
+      preserved_copy_target="tmux buffer"
+
+    elif command -v wl-copy >/dev/null 2>&1 &&
+         [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+      wl-copy < "$context_file"
+      preserved_copy_target="Wayland clipboard"
+
+    elif command -v xclip >/dev/null 2>&1 &&
+         [[ -n "${DISPLAY:-}" ]]; then
+      xclip -selection clipboard -in < "$context_file"
+      preserved_copy_target="X clipboard via xclip"
+
+    elif command -v pbcopy >/dev/null 2>&1; then
+      pbcopy < "$context_file"
+      preserved_copy_target="macOS clipboard"
+    fi
+
+    print -r -- \
+      "[trace] ${source_label} failed; accumulated context preserved and copied to ${preserved_copy_target}" >&2
+
+    return "$extract_status"
+  fi
+
+  # Only replace the latest clean buffer after extraction succeeded.
+  mv -- "$result_file" "$buffer_file"
+
+  local run_no
+
+  run_no="$(
+    cat "$counter_file" 2>/dev/null ||
+      print -r -- 0
+  )"
+
+  run_no=$((run_no + 1))
+  print -r -- "$run_no" > "$counter_file"
+
+  {
+    print -r -- ""
+    print -r -- \
+      "==================== trace copy ${run_no} ===================="
+    print -r -- "source: ${source_label}"
+    print -r -- "file: $target_file"
+    print -r -- "query: $query"
+
+    if [[ -s "$meta_file" ]]; then
+      cat "$meta_file"
+    fi
+
+    print -r -- \
+      "============================================================="
+
+    cat "$buffer_file"
+  } >> "$context_file"
+
+  cat "$buffer_file"
+
+  local copy_target="none"
+
+  if [[ -n "${TMUX:-}" ]] &&
+     command -v tmux >/dev/null 2>&1; then
+    tmux load-buffer "$context_file"
+    copy_target="tmux buffer"
+
+  elif command -v wl-copy >/dev/null 2>&1 &&
+       [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+    wl-copy < "$context_file"
+    copy_target="Wayland clipboard"
+
+  elif command -v xclip >/dev/null 2>&1 &&
+       [[ -n "${DISPLAY:-}" ]]; then
+    xclip -selection clipboard -in < "$context_file"
+    copy_target="X clipboard via xclip"
+
+  elif command -v pbcopy >/dev/null 2>&1; then
+    pbcopy < "$context_file"
+    copy_target="macOS clipboard"
+  fi
+
+  local line_count
+  local footer_label="${source_label}:${query}"
+
+  line_count=$(wc -l < "$buffer_file" | tr -d ' ')
+
+  if [[ "$mode" == "jq" ]]; then
+    footer_label="jq"
+  fi
+
+  trace_print_footer \
+    "$copy_target" \
+    "$context_file" \
+    "$line_count" \
+    "$footer_label"
+
+  rm -f "$meta_file"
+}
+
+trace_run_repo_diff() {
+  local before_root="$1"
+  local after_root="$2"
+
+  if [[ ! -d "$before_root" ]]; then
+    print -r -- "[trace] diff BEFORE repository not found: $before_root" >&2
+    return 1
+  fi
+
+  if [[ ! -d "$after_root" ]]; then
+    print -r -- "[trace] diff AFTER repository not found: $after_root" >&2
+    return 1
+  fi
+
+  local buffer_dir="${TRACE_BUFFER_DIR:-$HOME/.cache/trace}"
+  local buffer_file="${TRACE_BUFFER_FILE:-$buffer_dir/buffer.txt}"
+  local context_file="${TRACE_CONTEXT_FILE:-$buffer_dir/context.txt}"
+  local counter_file="${TRACE_COUNTER_FILE:-$buffer_dir/counter.txt}"
+
+  local temp_prefix="${buffer_file}.repo-diff.$$"
+  local paths_file="${temp_prefix}.paths"
+  local modified_file="${temp_prefix}.modified"
+  local added_file="${temp_prefix}.added"
+  local deleted_file="${temp_prefix}.deleted"
+  local diff_file="${temp_prefix}.diff"
+  local candidate_diff="${temp_prefix}.candidate"
+  mkdir -p "$buffer_dir"
+
+  : > "$buffer_file"
+  : > "$paths_file"
+  : > "$modified_file"
+  : > "$added_file"
+  : > "$deleted_file"
+  : > "$diff_file"
+  : > "$candidate_diff"
+  if [[ ! -f "$context_file" ]]; then
+    : > "$context_file"
+  fi
+
+  if [[ ! -f "$counter_file" ]]; then
+    print -r -- "0" > "$counter_file"
+  fi
+
+  {
+    find "$before_root" \
+      \( -type d \( \
+           -name '.git' -o \
+           -name '.ruff_cache' -o \
+           -name '__pycache__' -o \
+           -name '.venv' -o \
+           -name 'venv' -o \
+           -name 'vendor' -o \
+           -name 'node_modules' -o \
+           -name 'dist' -o \
+           -name 'build' -o \
+           -name 'coverage' -o \
+           -name 'tmp' -o \
+           -name 'bin' -o \
+           -name 'obj' \
+         \) -prune \) -o \
+      -type f \
+      -printf '%P\n'
+
+    find "$after_root" \
+      \( -type d \( \
+           -name '.git' -o \
+           -name '.ruff_cache' -o \
+           -name '__pycache__' -o \
+           -name '.venv' -o \
+           -name 'venv' -o \
+           -name 'vendor' -o \
+           -name 'node_modules' -o \
+           -name 'dist' -o \
+           -name 'build' -o \
+           -name 'coverage' -o \
+           -name 'tmp' -o \
+           -name 'bin' -o \
+           -name 'obj' \
+         \) -prune \) -o \
+      -type f \
+      -printf '%P\n'
+  } |
+    LC_ALL=C sort -u \
+    > "$paths_file"
+  local relative_path
+  local before_file
+  local after_file
+
+  while IFS= read -r relative_path; do
+    [[ -n "$relative_path" ]] || continue
+
+    before_file="${before_root}/${relative_path}"
+    after_file="${after_root}/${relative_path}"
+
+    if [[ -f "$before_file" && -f "$after_file" ]]; then
+      if ! cmp -s -- "$before_file" "$after_file"; then
+        print -r -- "$relative_path" >> "$modified_file"
+      fi
+    elif [[ -f "$after_file" ]]; then
+      print -r -- "$relative_path" >> "$added_file"
+    elif [[ -f "$before_file" ]]; then
+      print -r -- "$relative_path" >> "$deleted_file"
+    fi
+  done < "$paths_file"
+  local modified_count
+  local added_count
+  local deleted_count
+  local changed_count
+  local differences
+  local diff_files_returned=0
+  local diff_bytes_returned=0
+  local candidate_bytes=0
+  modified_count=$(
+    wc -l < "$modified_file" |
+      tr -d ' '
+  )
+
+  added_count=$(
+    wc -l < "$added_file" |
+      tr -d ' '
+  )
+
+  deleted_count=$(
+    wc -l < "$deleted_file" |
+      tr -d ' '
+  )
+  changed_count=$((modified_count + added_count + deleted_count))
+  if (( changed_count == 0 )); then
+    differences="none"
+  else
+    differences="present"
+
+    if command -v git >/dev/null 2>&1; then
+      while IFS= read -r relative_path; do
+        [[ -n "$relative_path" ]] || continue
+
+        : > "$candidate_diff"
+
+        git diff \
+          --no-index \
+          --no-color \
+          -- \
+          "${before_root}/${relative_path}" \
+          "${after_root}/${relative_path}" \
+          > "$candidate_diff" || true
+
+        candidate_bytes=$(
+          wc -c < "$candidate_diff" |
+            tr -d ' '
+        )
+
+
+        cat "$candidate_diff" >> "$diff_file"
+
+        diff_files_returned=$((diff_files_returned + 1))
+        diff_bytes_returned=$((diff_bytes_returned + candidate_bytes))
+      done < "$modified_file"
+
+      while IFS= read -r relative_path; do
+        [[ -n "$relative_path" ]] || continue
+
+        if (( diff_files_returned >= max_diff_files )); then
+          break
+        fi
+        : > "$candidate_diff"
+
+        git diff \
+          --no-index \
+          --no-color \
+          -- \
+          /dev/null \
+          "${after_root}/${relative_path}" \
+          > "$candidate_diff" || true
+
+        candidate_bytes=$(
+          wc -c < "$candidate_diff" |
+            tr -d ' '
+        )
+
+
+        cat "$candidate_diff" >> "$diff_file"
+
+        diff_files_returned=$((diff_files_returned + 1))
+        diff_bytes_returned=$((diff_bytes_returned + candidate_bytes))
+      done < "$added_file"
+
+      while IFS= read -r relative_path; do
+        [[ -n "$relative_path" ]] || continue
+
+
+        if (( diff_files_returned >= max_diff_files )); then
+          break
+        fi
+
+        : > "$candidate_diff"
+
+        git diff \
+          --no-index \
+          --no-color \
+          -- \
+          "${before_root}/${relative_path}" \
+          /dev/null \
+          > "$candidate_diff" || true
+
+        candidate_bytes=$(
+          wc -c < "$candidate_diff" |
+            tr -d ' '
+        )
+
+
+        cat "$candidate_diff" >> "$diff_file"
+
+        diff_files_returned=$((diff_files_returned + 1))
+        diff_bytes_returned=$((diff_bytes_returned + candidate_bytes))
+      done < "$deleted_file"
+
+    else
+      while IFS= read -r relative_path; do
+        [[ -n "$relative_path" ]] || continue
+
+
+        if (( diff_files_returned >= max_diff_files )); then
+          break
+        fi
+
+        : > "$candidate_diff"
+
+        diff -u \
+          -- \
+          "${before_root}/${relative_path}" \
+          "${after_root}/${relative_path}" \
+          > "$candidate_diff" || true
+
+        candidate_bytes=$(
+          wc -c < "$candidate_diff" |
+            tr -d ' '
+        )
+
+
+        cat "$candidate_diff" >> "$diff_file"
+
+        diff_files_returned=$((diff_files_returned + 1))
+        diff_bytes_returned=$((diff_bytes_returned + candidate_bytes))
+      done < "$modified_file"
+
+      while IFS= read -r relative_path; do
+        [[ -n "$relative_path" ]] || continue
+
+        if (( diff_files_returned >= max_diff_files )); then
+          break
+        fi
+
+        : > "$candidate_diff"
+
+        diff -u \
+          -- \
+          /dev/null \
+          "${after_root}/${relative_path}" \
+          > "$candidate_diff" || true
+
+        candidate_bytes=$(
+          wc -c < "$candidate_diff" |
+            tr -d ' '
+        )
+
+
+        cat "$candidate_diff" >> "$diff_file"
+
+        diff_files_returned=$((diff_files_returned + 1))
+        diff_bytes_returned=$((diff_bytes_returned + candidate_bytes))
+      done < "$added_file"
+
+      while IFS= read -r relative_path; do
+        [[ -n "$relative_path" ]] || continue
+
+
+        if (( diff_files_returned >= max_diff_files )); then
+          break
+        fi
+
+        : > "$candidate_diff"
+
+        diff -u \
+          -- \
+          "${before_root}/${relative_path}" \
+          /dev/null \
+          > "$candidate_diff" || true
+
+        candidate_bytes=$(
+          wc -c < "$candidate_diff" |
+            tr -d ' '
+        )
+
+        cat "$candidate_diff" >> "$diff_file"
+
+        diff_files_returned=$((diff_files_returned + 1))
+        diff_bytes_returned=$((diff_bytes_returned + candidate_bytes))
+      done < "$deleted_file"
+    fi
+  fi
+  {
+    print -r -- "comparison-direction: BEFORE -> AFTER"
+    print -r -- "comparison-kind: repository"
+    print -r -- "before: $before_root"
+    print -r -- "after: $after_root"
+    print -r -- "differences: $differences"
+    print -r -- "changed-files: $changed_count"
+    print -r -- "modified-files: $modified_count"
+    print -r -- "added-files: $added_count"
+    print -r -- "deleted-files: $deleted_count"
+    print -r -- "diff-files-returned: $diff_files_returned"
+    print -r -- "diff-bytes-returned: $diff_bytes_returned"
+
+    if (( modified_count > 0 )); then
+      print -r -- ""
+      print -r -- "MODIFIED"
+
+      while IFS= read -r relative_path; do
+        print -r -- "  $relative_path"
+      done < "$modified_file"
+    fi
+
+    if (( added_count > 0 )); then
+      print -r -- ""
+      print -r -- "ADDED"
+
+      while IFS= read -r relative_path; do
+        print -r -- "  $relative_path"
+      done < "$added_file"
+    fi
+
+    if (( deleted_count > 0 )); then
+      print -r -- ""
+      print -r -- "DELETED"
+
+      while IFS= read -r relative_path; do
+        print -r -- "  $relative_path"
+      done < "$deleted_file"
+    fi
+
+    if [[ "$differences" == "present" ]]; then
+      print -r -- ""
+      print -r -- "==================== DIFF HUNKS ===================="
+      cat "$diff_file"
+    fi
+  } > "$buffer_file"
+
+  local run_no
+
+  run_no="$(
+    cat "$counter_file" 2>/dev/null ||
+      print -r -- 0
+  )"
+
+  run_no=$((run_no + 1))
+
+  print -r -- "$run_no" > "$counter_file"
+
+  {
+    print -r -- ""
+    print -r -- \
+      "==================== trace copy ${run_no} ===================="
+    print -r -- "source: diff"
+    print -r -- "comparison-kind: repository"
+    print -r -- "before: $before_root"
+    print -r -- "after: $after_root"
+    print -r -- \
+      "============================================================="
+    cat "$buffer_file"
+  } >> "$context_file"
+
+  cat "$buffer_file"
+
+  local copy_target="none"
+
+  if [[ -n "${TMUX:-}" ]] &&
+     command -v tmux >/dev/null 2>&1; then
+    tmux load-buffer "$context_file"
+    copy_target="tmux buffer"
+
+  elif command -v wl-copy >/dev/null 2>&1 &&
+       [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+    wl-copy < "$context_file"
+    copy_target="Wayland clipboard"
+
+  elif command -v xclip >/dev/null 2>&1 &&
+       [[ -n "${DISPLAY:-}" ]]; then
+    xclip \
+      -selection clipboard \
+      -in \
+      < "$context_file"
+    copy_target="X clipboard via xclip"
+
+  elif command -v pbcopy >/dev/null 2>&1; then
+    pbcopy < "$context_file"
+    copy_target="macOS clipboard"
+  fi
+
+  local line_count
+
+  line_count=$(
+    wc -l < "$buffer_file" |
+      tr -d ' '
+  )
+
+  trace_print_footer \
+    "$copy_target" \
+    "$context_file" \
+    "$line_count" \
+    "diff:repository"
+
+  rm -f -- \
+    "$paths_file" \
+    "$modified_file" \
+    "$added_file" \
+    "$deleted_file" \
+    "$diff_file" \
+    "$candidate_diff"
+}
+
+trace_run_symbol_diff() {
+  local before_file="$1"
+  local after_file="$2"
+  local symbol="$3"
+
+  if [[ ! -f "$before_file" ]]; then
+    print -r -- "[trace] diff-symbol BEFORE file not found: $before_file" >&2
+    return 1
+  fi
+
+  if [[ ! -f "$after_file" ]]; then
+    print -r -- "[trace] diff-symbol AFTER file not found: $after_file" >&2
+    return 1
+  fi
+
+  local before_resolved
+  local after_resolved
+
+  case "$before_file" in
+    *.py)
+      before_resolved="$(
+        trace_resolve_python_function_range \
+          "$before_file" \
+          "$symbol"
+      )"
+      ;;
+    #
+    #
+    *.js|*.jsx|*.ts|*.tsx|*.html)
+      before_resolved="$(
+        trace_resolve_js_ts_function_range \
+          "$before_file" \
+          "$symbol"
+      )"
+      ;;
+
+    *.sh|*.bash|*.zsh|*/trace|trace)
+      before_resolved="$(
+        trace_resolve_shell_function_range \
+          "$before_file" \
+          "$symbol"
+      )"
+      ;;
+
+    *)
+      print -r -- \
+        "[trace] --diff-symbol does not support BEFORE file type yet: $before_file" >&2
+      return 1
+      ;;
+  esac
+
+  case "$after_file" in
+    *.py)
+      after_resolved="$(
+        trace_resolve_python_function_range \
+          "$after_file" \
+          "$symbol"
+      )"
+      ;;
+    #
+     *.js|*.jsx|*.ts|*.tsx|*.html)
+      after_resolved="$(
+        trace_resolve_js_ts_function_range \
+          "$after_file" \
+          "$symbol"
+      )"
+      ;;
+
+    *.sh|*.bash|*.zsh|*/trace|trace)
+      after_resolved="$(
+        trace_resolve_shell_function_range \
+          "$after_file" \
+          "$symbol"
+      )"
+      ;;
+
+    *)
+      print -r -- \
+        "[trace] --diff-symbol does not support AFTER file type yet: $after_file" >&2
+      return 1
+      ;;
+  esac
+  case "$before_resolved" in
+    NONE)
+      print -r -- \
+        "[trace] BEFORE symbol not found: $symbol" >&2
+      return 1
+      ;;
+    MULTIPLE)
+      print -r -- \
+        "[trace] BEFORE symbol has multiple matches: $symbol" >&2
+      return 1
+      ;;
+  esac
+
+  case "$after_resolved" in
+    NONE)
+      print -r -- \
+        "[trace] AFTER symbol not found: $symbol" >&2
+      return 1
+      ;;
+    MULTIPLE)
+      print -r -- \
+        "[trace] AFTER symbol has multiple matches: $symbol" >&2
+      return 1
+      ;;
+  esac
+
+  local before_start="${before_resolved%% *}"
+  local before_end="${before_resolved##* }"
+  local after_start="${after_resolved%% *}"
+  local after_end="${after_resolved##* }"
+
+  local buffer_dir="${TRACE_BUFFER_DIR:-$HOME/.cache/trace}"
+  local buffer_file="${TRACE_BUFFER_FILE:-$buffer_dir/buffer.txt}"
+  local context_file="${TRACE_CONTEXT_FILE:-$buffer_dir/context.txt}"
+  local counter_file="${TRACE_COUNTER_FILE:-$buffer_dir/counter.txt}"
+
+  local temp_prefix="${buffer_file}.diff-symbol.$$"
+  local before_slice="${temp_prefix}.before"
+  local after_slice="${temp_prefix}.after"
+  local diff_file="${temp_prefix}.diff"
+
+  mkdir -p "$buffer_dir"
+
+  : > "$buffer_file"
+  : > "$before_slice"
+  : > "$after_slice"
+  : > "$diff_file"
+
+  if [[ ! -f "$context_file" ]]; then
+    : > "$context_file"
+  fi
+
+  if [[ ! -f "$counter_file" ]]; then
+    print -r -- "0" > "$counter_file"
+  fi
+
+  sed -n \
+    "${before_start},${before_end}p" \
+    "$before_file" \
+    > "$before_slice"
+
+  sed -n \
+    "${after_start},${after_end}p" \
+    "$after_file" \
+    > "$after_slice"
+
+  local differences="present"
+
+  if cmp -s -- "$before_slice" "$after_slice"; then
+    differences="none"
+  else
+    if command -v git >/dev/null 2>&1; then
+      git diff \
+        --no-index \
+        --no-color \
+        -- \
+        "$before_slice" \
+        "$after_slice" \
+        > "$diff_file" || true
+    else
+      diff -u \
+        -- \
+        "$before_slice" \
+        "$after_slice" \
+        > "$diff_file" || true
+    fi
+  fi
+
+  {
+    print -r -- "comparison-direction: BEFORE -> AFTER"
+    print -r -- "comparison-kind: symbol"
+    print -r -- "symbol: $symbol"
+    print -r -- "before: $before_file"
+    print -r -- "after: $after_file"
+    print -r -- "before-lines: ${before_start}-${before_end}"
+    print -r -- "after-lines: ${after_start}-${after_end}"
+    print -r -- "differences: $differences"
+
+    if [[ "$differences" == "present" ]]; then
+      print -r -- ""
+      cat "$diff_file"
+    fi
+  } > "$buffer_file"
+
+  local run_no
+
+  run_no="$(
+    cat "$counter_file" 2>/dev/null ||
+      print -r -- 0
+  )"
+
+  run_no=$((run_no + 1))
+  print -r -- "$run_no" > "$counter_file"
+
+  {
+    print -r -- ""
+    print -r -- \
+      "==================== trace copy ${run_no} ===================="
+    print -r -- "source: diff-symbol"
+    print -r -- "symbol: $symbol"
+    print -r -- "before: $before_file"
+    print -r -- "after: $after_file"
+    print -r -- \
+      "============================================================="
+    cat "$buffer_file"
+  } >> "$context_file"
+
+  cat "$buffer_file"
+
+  local copy_target="none"
+
+  if [[ -n "${TMUX:-}" ]] &&
+     command -v tmux >/dev/null 2>&1; then
+    tmux load-buffer "$context_file"
+    copy_target="tmux buffer"
+
+  elif command -v wl-copy >/dev/null 2>&1 &&
+       [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+    wl-copy < "$context_file"
+    copy_target="Wayland clipboard"
+
+  elif command -v xclip >/dev/null 2>&1 &&
+       [[ -n "${DISPLAY:-}" ]]; then
+    xclip \
+      -selection clipboard \
+      -in \
+      < "$context_file"
+    copy_target="X clipboard via xclip"
+
+  elif command -v pbcopy >/dev/null 2>&1; then
+    pbcopy < "$context_file"
+    copy_target="macOS clipboard"
+  fi
+
+  local line_count
+
+  line_count=$(
+    wc -l < "$buffer_file" |
+      tr -d ' '
+  )
+
+  trace_print_footer \
+    "$copy_target" \
+    "$context_file" \
+    "$line_count" \
+    "diff-symbol:${symbol}"
+
+  rm -f -- \
+    "$before_slice" \
+    "$after_slice" \
+    "$diff_file"
+}
+
+
+trace_run_file_diff() {
+  local before_file="$1"
+  local after_file="$2"
+
+  if [[ ! -f "$before_file" ]]; then
+    print -r -- "[trace] diff BEFORE file not found: $before_file" >&2
+    return 1
+  fi
+
+  if [[ ! -f "$after_file" ]]; then
+    print -r -- "[trace] diff AFTER file not found: $after_file" >&2
+    return 1
+  fi
+
+  local buffer_dir="${TRACE_BUFFER_DIR:-$HOME/.cache/trace}"
+  local buffer_file="${TRACE_BUFFER_FILE:-$buffer_dir/buffer.txt}"
+  local context_file="${TRACE_CONTEXT_FILE:-$buffer_dir/context.txt}"
+  local counter_file="${TRACE_COUNTER_FILE:-$buffer_dir/counter.txt}"
+  local diff_file="${buffer_file}.diff.$$"
+
+  mkdir -p "$buffer_dir"
+  : > "$buffer_file"
+  : > "$diff_file"
+
+  if [[ ! -f "$context_file" ]]; then
+    : > "$context_file"
+  fi
+
+  if [[ ! -f "$counter_file" ]]; then
+    print -r -- "0" > "$counter_file"
+  fi
+
+  local differences="present"
+
+  if cmp -s -- "$before_file" "$after_file"; then
+    differences="none"
+  else
+    if command -v git >/dev/null 2>&1; then
+      git diff \
+        --no-index \
+        --no-color \
+        -- \
+        "$before_file" \
+        "$after_file" \
+        > "$diff_file" || true
+    else
+      diff -u \
+        -- \
+        "$before_file" \
+        "$after_file" \
+        > "$diff_file" || true
+    fi
+  fi
+
+  {
+    print -r -- "comparison-direction: BEFORE -> AFTER"
+    print -r -- "before: $before_file"
+    print -r -- "after: $after_file"
+    print -r -- "differences: $differences"
+
+    if [[ "$differences" == "present" ]]; then
+      print -r -- ""
+      cat "$diff_file"
+    fi
+  } > "$buffer_file"
+
+  local run_no
+
+  run_no="$(cat "$counter_file" 2>/dev/null || print -r -- 0)"
+  run_no=$((run_no + 1))
+  print -r -- "$run_no" > "$counter_file"
+
+  {
+    print -r -- ""
+    print -r -- \
+      "==================== trace copy ${run_no} ===================="
+    print -r -- "source: diff"
+    print -r -- "before: $before_file"
+    print -r -- "after: $after_file"
+    print -r -- \
+      "============================================================="
+    cat "$buffer_file"
+  } >> "$context_file"
+
+  cat "$buffer_file"
+
+  local copy_target="none"
+
+  if [[ -n "${TMUX:-}" ]] && command -v tmux >/dev/null 2>&1; then
+    tmux load-buffer "$context_file"
+    copy_target="tmux buffer"
+  elif command -v wl-copy >/dev/null 2>&1 &&
+       [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+    wl-copy < "$context_file"
+    copy_target="Wayland clipboard"
+  elif command -v xclip >/dev/null 2>&1 &&
+       [[ -n "${DISPLAY:-}" ]]; then
+    xclip -selection clipboard -in < "$context_file"
+    copy_target="X clipboard via xclip"
+  elif command -v pbcopy >/dev/null 2>&1; then
+    pbcopy < "$context_file"
+    copy_target="macOS clipboard"
+  fi
+
+  local line_count
+
+  line_count=$(wc -l < "$buffer_file" | tr -d ' ')
+
+  trace_print_footer \
+    "$copy_target" \
+    "$context_file" \
+    "$line_count" \
+    "diff"
+
+  rm -f -- "$diff_file"
+}
+
+trace_apply_replace_range() {
+  local start_line="$1"
+  local end_line="$2"
+  local target_file="$3"
+  local expected_label="$4"
+
+  if [[ ! "$start_line" =~ '^[0-9]+$' ]] || [[ ! "$end_line" =~ '^[0-9]+$' ]]; then
+    print -r -- "[trace] replace requires numeric start/end lines" >&2
+    exit 1
+  fi
+
+  if [[ ! -f "$target_file" ]]; then
+    print -r -- "[trace] replace target file not found: $target_file" >&2
+    exit 1
+  fi
+
+  if (( start_line <= 0 || end_line < start_line )); then
+    print -r -- "[trace] invalid range: ${start_line}-${end_line}" >&2
+    exit 1
+  fi
+
+
+  old_block="$(sed -n "${start_line},${end_line}p" "$target_file")"
+
+  if ! print -r -- "$old_block" | grep -Fq -- "$expected_label"; then
+    print -r -- "[trace] expected label not found in resolved range" >&2
+    print -r -- "  file   : $target_file" >&2
+    print -r -- "  lines  : ${start_line}-${end_line}" >&2
+    print -r -- "  expect : $expected_label" >&2
+    exit 1
+  fi
+
+  tmp_dir="${TRACE_BUFFER_DIR:-$HOME/.cache/trace}"
+  mkdir -p "$tmp_dir"
+
+  replacement_file="${tmp_dir}/replacement.tmp"
+  ext="${target_file:e}"
+  if [[ -n "$ext" ]]; then
+    new_file="${tmp_dir}/replace.$$.${ext}"
+  else
+    new_file="${tmp_dir}/replace.$$"
+  fi
+
+  backup_file="${target_file}.trace.bak.$(date +%Y%m%d%H%M%S)"
+
+  print -r -- "[trace] replacing:"
+  print -r -- "  file   : $target_file"
+  print -r -- "  lines  : ${start_line}-${end_line}"
+  print -r -- "  expect : $expected_label"
+  print -r -- ""
+  print -r -- "Paste replacement now. Press Ctrl-D when finished."
+  print -r -- "------------------------------------------------------------"
+
+  cat > "$replacement_file"
+
+  if [[ ! -s "$replacement_file" ]]; then
+    print -r -- "[trace] replacement was empty; aborting" >&2
+    exit 1
+  fi
+
+  if ! grep -Fq -- "$expected_label" "$replacement_file"; then
+    print -r -- "[trace] expected label not found in pasted replacement" >&2
+    print -r -- "  expect: $expected_label" >&2
+    exit 1
+  fi
+
+  cp "$target_file" "$backup_file"
+
+  awk -v start="$start_line" -v end="$end_line" -v repl="$replacement_file" '
+    NR == start {
+      while ((getline line < repl) > 0) {
+        print line
+      }
+    }
+
+    NR < start || NR > end {
+      print
+    }
+  ' "$target_file" > "$new_file"
+
+  set +e
+  validation_output="$(trace_validate_file_syntax "$new_file" 2>&1)"
+  validation_status=$?
+  set -e
+
+  if (( validation_status != 0 )); then
+    print -r -- "[trace] syntax validation failed; target file unchanged" >&2
+    print -r -- ""
+    print -r -- "$validation_output" >&2
+    print -r -- ""
+    print -r -- "backup: $backup_file" >&2
+    rm -f "$replacement_file" "$new_file"
+    exit 1
+  fi
+
+  if cmp -s "$backup_file" "$new_file"; then
+    print -r -- "[trace] replacement is identical; target file unchanged"
+    rm -f "$replacement_file" "$new_file" "$backup_file"
+    exit 0
+  fi
+
+  print -r -- ""
+  print -r -- "[trace] diff:"
+  print -r -- "------------------------------------------------------------"
+
+  if command -v git >/dev/null 2>&1; then
+    git diff --no-index --color=always "$backup_file" "$new_file" || true
+  else
+    diff -u "$backup_file" "$new_file" || true
+  fi
+
+  print -r -- "------------------------------------------------------------"
+  print -r -- ""
+
+  print -n -- "Apply replacement? [y/N] "
+  read -r answer
+
+  case "$answer" in
+    y|Y|yes|YES)
+      cp "$new_file" "$target_file"
+      print -r -- "[trace] replacement applied"
+      print -r -- "  backup: $backup_file"
+      ;;
+    *)
+      print -r -- "[trace] replacement cancelled; target file unchanged"
+      print -r -- "  backup: $backup_file"
+      ;;
+  esac
+
+  rm -f "$replacement_file" "$new_file"
+}
+
+
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  usage
+  exit 0
+fi
+if [[ $# -lt 1 ]]; then
+  usage
+  exit 1
+fi
+if [[ "${1:-}" == "--diff-symbol" ]]; then
+  shift
+
+  if [[ $# -ne 3 ]]; then
+    print -r -- "[trace] usage:" >&2
+    print -r -- \
+      "  trace --diff-symbol <before-file> <after-file> <symbol>" >&2
+    exit 1
+  fi
+
+  trace_run_symbol_diff \
+    "$1" \
+    "$2" \
+    "$3"
+
+  exit $?
+fi
+if [[ "${1:-}" == "--diff" ]]; then
+  shift
+
+  if [[ $# -ne 2 ]]; then
+    print -r -- "[trace] usage:" >&2
+    print -r -- " trace --diff <before> <after>" >&2
+    exit 1
+  fi
+  if [[ -d "$1" && -d "$2" ]]; then
+    trace_run_repo_diff \
+      "$1" \
+      "$2"
+
+  elif [[ -f "$1" && -f "$2" ]]; then
+    trace_run_file_diff \
+      "$1" \
+      "$2"
+
+  else
+    print -r -- \
+      "[trace] --diff inputs must both be files or both be directories" >&2
+    print -r -- "  BEFORE: $1" >&2
+    print -r -- "  AFTER : $2" >&2
+    exit 1
+  fi
+
+  exit $?
+fi
+
+# if [[ "${1:-}" == "--clear" ]]; then
+#   buffer_dir="${TRACE_BUFFER_DIR:-$HOME/.cache/trace}"
+#   buffer_file="${TRACE_BUFFER_FILE:-$buffer_dir/buffer.txt}"
+#   context_file="${TRACE_CONTEXT_FILE:-$buffer_dir/context.txt}"
+#   counter_file="${TRACE_COUNTER_FILE:-$buffer_dir/counter.txt}"
+#
+#   mkdir -p "$buffer_dir"
+#   : > "$buffer_file"
+#   : > "$context_file"
+#   print -r -- "0" > "$counter_file"
+#
+#
+#   exit 0
+# fi
+
+if [[ "${1:-}" == "--clear" ]]; then
+  buffer_dir="${TRACE_BUFFER_DIR:-$HOME/.cache/trace}"
+  buffer_file="${TRACE_BUFFER_FILE:-$buffer_dir/buffer.txt}"
+  context_file="${TRACE_CONTEXT_FILE:-$buffer_dir/context.txt}"
+  counter_file="${TRACE_COUNTER_FILE:-$buffer_dir/counter.txt}"
+  mkdir -p "$buffer_dir"
+
+  buffer_lines=0
+  context_lines=0
+
+  if [[ -f "$buffer_file" ]]; then
+    buffer_lines=$(wc -l < "$buffer_file" | tr -d ' ')
+  fi
+
+  if [[ -f "$context_file" ]]; then
+    context_lines=$(wc -l < "$context_file" | tr -d ' ')
+  fi
+
+  : > "$buffer_file"
+  : > "$context_file"
+  print -r -- "0" > "$counter_file"
+
+#   print -r -- "[trace] cleared latest ${buffer_lines} lines and context ${context_lines} lines"
+#   print -r -- "[trace] cleared:"
+  print -r -- "[trace] cleared:"
+  print -r -- "  latest buffer : ${buffer_lines} lines"
+  print -r -- "  context stack : ${context_lines} lines"
+  exit 0
+fi
+
+if [[ "${1:-}" == "--tree" ]]; then
+  shift
+
+  tree_path="${1:-.}"
+
+  if [[ ! -d "$tree_path" ]]; then
+    print -r -- "[trace] tree path is not a directory: $tree_path" >&2
+    exit 1
+  fi
+
+  buffer_dir="${TRACE_BUFFER_DIR:-$HOME/.cache/trace}"
+  buffer_file="${TRACE_BUFFER_FILE:-$buffer_dir/buffer.txt}"
+  context_file="${TRACE_CONTEXT_FILE:-$buffer_dir/context.txt}"
+  counter_file="${TRACE_COUNTER_FILE:-$buffer_dir/counter.txt}"
+
+  mkdir -p "$buffer_dir"
+  : > "$buffer_file"
+  if command -v tree >/dev/null 2>&1; then
+    {
+      print -r -- "==================== DIRECTORY CONTEXT ===================="
+      print -r -- "path: $(realpath "$tree_path" 2>/dev/null || print -r -- "$tree_path")"
+      print -r -- "==========================================================="
+      print -r -- ""
+
+      tree \
+        -a \
+        -I 'node_modules|.git|dist|build|coverage|tmp|vendor|__pycache__|.venv|venv|bin|obj' \
+        "$tree_path"
+    } > "$buffer_file"
+
+  else
+    {
+      print -r -- "$tree_path"
+
+      find "$tree_path" \
+        \( -path '*/node_modules' -o \
+           -path '*/.git' -o \
+           -path '*/dist' -o \
+           -path '*/build' -o \
+           -path '*/coverage' -o \
+           -path '*/tmp' -o \
+           -path '*/vendor' -o \
+           -path '*/__pycache__' -o \
+           -path '*/.venv' -o \
+           -path '*/venv' -o \
+           -path '*/bin' -o \
+           -path '*/obj' \) \
+        -prune -o -print |
+        sed "s#^\./##" |
+        awk '
+          NR == 1 { print; next }
+          {
+            path = $0
+            depth = gsub("/", "/", path)
+            name = path
+            sub(/^.*\//, "", name)
+
+            indent = ""
+            for (i = 0; i < depth; i++) {
+              indent = indent "  "
+            }
+
+            print indent "├── " name
+          }
+        '
+    } > "$buffer_file"
+  fi
+  if [[ ! -f "$context_file" ]]; then
+    : > "$context_file"
+  fi
+
+  if [[ ! -f "$counter_file" ]]; then
+    print -r -- "0" > "$counter_file"
+  fi
+
+  run_no="$(cat "$counter_file" 2>/dev/null || print -r -- 0)"
+  run_no=$((run_no + 1))
+  print -r -- "$run_no" > "$counter_file"
+
+  {
+    print -r -- ""
+    print -r -- "==================== trace copy ${run_no} ===================="
+    print -r -- "source: tree"
+    print -r -- "path: $tree_path"
+    print -r -- "============================================================="
+    cat "$buffer_file"
+  } >> "$context_file"
+
+  cat "$buffer_file"
+
+  copy_target="none"
+
+  if [[ -n "${TMUX:-}" ]] && command -v tmux >/dev/null 2>&1; then
+    tmux load-buffer "$context_file"
+    copy_target="tmux buffer"
+  elif command -v wl-copy >/dev/null 2>&1 && [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+    wl-copy < "$context_file"
+    copy_target="Wayland clipboard"
+  elif command -v xclip >/dev/null 2>&1 && [[ -n "${DISPLAY:-}" ]]; then
+    xclip -selection clipboard -in < "$context_file"
+    copy_target="X clipboard via xclip"
+  elif command -v pbcopy >/dev/null 2>&1; then
+    pbcopy < "$context_file"
+    copy_target="macOS clipboard"
+  fi
+  line_count=$(wc -l < "$buffer_file" | tr -d ' ')
+  byte_count=$(wc -c < "$buffer_file" | tr -d ' ')
+  context_lines=$(wc -l < "$context_file" | tr -d ' ')
+  context_bytes=$(wc -c < "$context_file" | tr -d ' ')
+
+  print -r -- "[trace] copy ${run_no}: latest ${line_count} lines / ${byte_count} bytes"
+  print -r -- "  latest : $buffer_file"
+  print -r -- "  context: $context_file"
+  print -r -- "  size   : ${context_lines} lines / ${context_bytes} bytes"
+  print -r -- "  copied : ${copy_target}"
+
+  exit 0
+#   line_count=$(wc -l < "$buffer_file" | tr -d ' ')
+#
+#   print -r -- "[trace] tree ${line_count} lines copied to ${copy_target}" >&2
+#
+#   exit 0
+fi
+
+if [[ "${1:-}" == "--html-id" ]] || \
+   [[ "${1:-}" == "--html-class" ]] || \
+   [[ "${1:-}" == "--html-tag" ]] || \
+   [[ "${1:-}" == "--css" ]] || \
+   [[ "${1:-}" == "--json-path" ]] || \
+   [[ "${1:-}" == "-jq" ]] || \
+   [[ "${1:-}" == "--yaml-path" ]] || \
+   [[ "${1:-}" == "--heading" ]]; then
+
+  structured_flag="${1:-}"
+  shift
+
+  if [[ $# -ne 2 ]] || [[ ! -f "${1:-}" ]]; then
+    print -r -- "[trace] usage:" >&2
+    print -r -- "  trace --html-id <file> <id>" >&2
+    print -r -- "  trace --html-class <file> <class>" >&2
+    print -r -- "  trace --html-tag <file> <tag>" >&2
+    print -r -- "  trace --css <file> <selector>" >&2
+    print -r -- "  trace --json-path <file> <path>" >&2
+    print -r -- "  trace -jq <file> <filter>" >&2
+    print -r -- "  trace --yaml-path <file> <path>" >&2
+    print -r -- "  trace --heading <file> <heading>" >&2
+    exit 1
+  fi
+
+  target_file="$1"
+  structured_query="$2"
+
+  case "$structured_flag" in
+    --html-id)
+      trace_run_structured_extract \
+        "html-id" \
+        "html-id" \
+        "$target_file" \
+        "$structured_query"
+      ;;
+
+    --html-class)
+      trace_run_structured_extract \
+        "html-class" \
+        "html-class" \
+        "$target_file" \
+        "$structured_query"
+      ;;
+
+    --css)
+      trace_run_structured_extract \
+        "css" \
+        "css" \
+        "$target_file" \
+        "$structured_query"
+      ;;
+
+    --json-path)
+      trace_run_structured_extract \
+        "json-path" \
+        "json-path" \
+        "$target_file" \
+        "$structured_query"
+      ;;
+    --html-tag)
+      trace_run_structured_extract \
+        "html-tag" \
+        "html-tag" \
+        "$target_file" \
+        "$structured_query"
+      ;;
+
+    -jq)
+      trace_run_structured_extract \
+        "jq" \
+        "jq" \
+        "$target_file" \
+        "$structured_query"
+      ;;
+
+    --yaml-path)
+      trace_run_structured_extract \
+        "yaml-path" \
+        "yaml-path" \
+        "$target_file" \
+        "$structured_query"
+      ;;
+
+    --heading)
+      trace_run_structured_extract \
+        "heading" \
+        "heading" \
+        "$target_file" \
+        "$structured_query"
+      ;;
+  esac
+
+  exit 0
+fi
+
+
+if [[ "${1:-}" == "--context" ]]; then
+  shift
+
+  if [[ $# -lt 2 ]] || [[ ! "${1:-}" =~ '^[0-9]+$' ]]; then
+    print -r -- "[trace] usage:" >&2
+    print -r -- "  trace --context <N> <pattern> [path...]" >&2
+    exit 1
+  fi
+
+  context_radius="$1"
+  shift
+
+  pattern="${1:-}"
+  shift || true
+
+  if [[ -z "$pattern" ]]; then
+    print -r -- "[trace] --context requires a pattern" >&2
+    exit 1
+  fi
+
+  if [[ $# -gt 0 ]]; then
+    paths=("$@")
+  else
+    paths=(.)
+  fi
+
+  buffer_dir="${TRACE_BUFFER_DIR:-$HOME/.cache/trace}"
+  buffer_file="${TRACE_BUFFER_FILE:-$buffer_dir/buffer.txt}"
+  context_file="${TRACE_CONTEXT_FILE:-$buffer_dir/context.txt}"
+  counter_file="${TRACE_COUNTER_FILE:-$buffer_dir/counter.txt}"
+  tmp_color_file="${buffer_file}.color.tmp"
+
+  mkdir -p "$buffer_dir"
+  : > "$buffer_file"
+  : > "$tmp_color_file"
+
+  if [[ ! -f "$context_file" ]]; then
+    : > "$context_file"
+  fi
+
+  if [[ ! -f "$counter_file" ]]; then
+    print -r -- "0" > "$counter_file"
+  fi
+  type_filters=(
+    --glob '**/*.{cs,js,jsx,ts,tsx,py,sh,bash,zsh}'
+    --glob '**/trace'
+    --glob '**/*.{html,css,scss}'
+    --glob '**/*.{json,yaml,yml,toml,ini,conf,env,sql}'
+    --glob '**/*.{md,txt,rst}'
+  )
+
+  common_args=(
+    -n
+    -C "$context_radius"
+    --color always
+
+    "${type_filters[@]}"
+    --glob '!**/node_modules/**'
+    --glob '!**/.git/**'
+    --glob '!**/dist/**'
+    --glob '!**/build/**'
+    --glob '!**/coverage/**'
+    --glob '!**/tmp/**'
+    --glob '!**/vendor/**'
+    --glob '!**/__pycache__/**'
+    --glob '!**/.venv/**'
+    --glob '!**/venv/**'
+    --glob '!**/bin/**'
+    --glob '!**/obj/**'
+    --glob '!**/runs/**'
+    --glob '!**/repos/**'
+
+    --glob '!**/*.min.js'
+    --glob '!**/*.min.css'
+    --glob '!**/*.map'
+    --glob '!**/*.bundle.js'
+    --glob '!**/*.chunk.js'
+    --glob '!**/*.generated.*'
+    --glob '!**/*bak*'
+    --glob '!**/*.trace.bak.*'
+    --glob '!**/agent.log'
+    --glob '!**/events.jsonl'
+    --glob '!**/meta.json'
+    --glob '!**/final.json'
+    --glob '!**/deoplete.log'
+    --glob '!**/state.json'
+    --glob '!**/state.json.bak'
+    --glob '!**/*.lock'
+  )
+
+  set +e
+  rg "${common_args[@]}" "$pattern" "${paths[@]}" | tee "$tmp_color_file"
+  pipe_status=("${pipestatus[@]}")
+  set -e
+
+  rg_status="${pipe_status[1]:-${pipe_status[0]:-0}}"
+  perl -pe 's/\e\[[0-9;]*m//g' "$tmp_color_file" > "$buffer_file"
+
+  run_no="$(cat "$counter_file" 2>/dev/null || print -r -- 0)"
+  run_no=$((run_no + 1))
+  print -r -- "$run_no" > "$counter_file"
+
+  {
+    print -r -- ""
+    print -r -- "==================== trace copy ${run_no} ===================="
+    print -r -- "source: context"
+    print -r -- "pattern: $pattern"
+    print -r -- "context: ${context_radius}"
+    print -r -- "path: ${paths[*]}"
+    print -r -- "============================================================="
+    cat "$buffer_file"
+  } >> "$context_file"
+
+  if [[ "$rg_status" -eq 1 ]]; then
+    print -r -- "[trace] no matches. clean buffer saved: $buffer_file" >&2
+    exit 1
+  elif [[ "$rg_status" -ne 0 ]]; then
+    print -r -- "[trace] rg failed with status $rg_status. clean buffer saved: $buffer_file" >&2
+    exit "$rg_status"
+  fi
+
+  copy_target="none"
+
+  if [[ -n "${TMUX:-}" ]] && command -v tmux >/dev/null 2>&1; then
+    tmux load-buffer "$context_file"
+    copy_target="tmux buffer"
+  elif command -v wl-copy >/dev/null 2>&1 && [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+    wl-copy < "$context_file"
+    copy_target="Wayland clipboard"
+  elif command -v xclip >/dev/null 2>&1 && [[ -n "${DISPLAY:-}" ]]; then
+    xclip -selection clipboard -in < "$context_file"
+    copy_target="X clipboard via xclip"
+  elif command -v pbcopy >/dev/null 2>&1; then
+    pbcopy < "$context_file"
+    copy_target="macOS clipboard"
+  fi
+
+  line_count=$(wc -l < "$buffer_file" | tr -d ' ')
+  trace_print_footer "$copy_target" "$context_file" "$line_count" "context:${pattern}"
+  rm -f "$tmp_color_file"
+  exit 0
+fi
+
+if [[ "${1:-}" == "--symbol" ]]; then
+  shift
+
+  if [[ $# -ne 2 ]] || [[ ! -f "${1:-}" ]]; then
+    print -r -- "[trace] usage:" >&2
+    print -r -- "  trace --symbol <file> <symbol>" >&2
+    exit 1
+  fi
+
+  target_file="$1"
+  symbol="$2"
+
+  case "$target_file" in
+    *.py)
+      resolved="$(trace_resolve_python_function_range "$target_file" "$symbol")"
+      ;;
+    *.js|*.jsx|*.ts|*.tsx|*.html)
+      resolved="$(trace_resolve_js_ts_function_range "$target_file" "$symbol")"
+      ;;
+    *.cs|*.java)
+      resolved="$(trace_resolve_csharp_function_range "$target_file" "$symbol")"
+      ;;
+    *.yml|*.yaml)
+      resolved="$(trace_resolve_ansible_task_range "$target_file" "$symbol")"
+      ;;
+    *.sh|*.bash|*.zsh|*/trace|trace)
+      resolved="$(trace_resolve_shell_function_range "$target_file" "$symbol")"
+      ;;
+    *)
+      print -r -- "[trace] --symbol does not support this file type yet: $target_file" >&2
+      exit 1
+      ;;
+  esac
+  case "$resolved" in
+    NONE)
+      print -r -- "[trace] symbol not found: $symbol" >&2
+      exit 1
+      ;;
+    MULTIPLE)
+      print -r -- "[trace] multiple matches found: $symbol" >&2
+      print -r -- "[trace] use range mode or a more specific symbol" >&2
+      exit 1
+      ;;
+  esac
+
+  start_line="${resolved%% *}"
+  end_line="${resolved##* }"
+
+  buffer_dir="${TRACE_BUFFER_DIR:-$HOME/.cache/trace}"
+  buffer_file="${TRACE_BUFFER_FILE:-$buffer_dir/buffer.txt}"
+  context_file="${TRACE_CONTEXT_FILE:-$buffer_dir/context.txt}"
+  counter_file="${TRACE_COUNTER_FILE:-$buffer_dir/counter.txt}"
+  tmp_color_file="${buffer_file}.color.tmp"
+
+  mkdir -p "$buffer_dir"
+  : > "$buffer_file"
+  : > "$tmp_color_file"
+
+  bat_cmd=""
+  if command -v bat >/dev/null 2>&1; then
+    bat_cmd="bat"
+  elif command -v batcat >/dev/null 2>&1; then
+    bat_cmd="batcat"
+  fi
+
+  if [[ -n "$bat_cmd" ]]; then
+    "$bat_cmd" \
+      --color=always \
+      --style=plain \
+      --paging=never \
+      --line-range "${start_line}:${end_line}" \
+      "$target_file" | tee "$tmp_color_file"
+
+    perl -pe 's/\e\[[0-9;]*m//g' "$tmp_color_file" > "$buffer_file"
+  else
+    sed -n "${start_line},${end_line}p" "$target_file" | tee "$buffer_file"
+  fi
+
+  if [[ ! -f "$context_file" ]]; then
+    : > "$context_file"
+  fi
+
+  if [[ ! -f "$counter_file" ]]; then
+    print -r -- "0" > "$counter_file"
+  fi
+
+  run_no="$(cat "$counter_file" 2>/dev/null || print -r -- 0)"
+  run_no=$((run_no + 1))
+  print -r -- "$run_no" > "$counter_file"
+
+  {
+    print -r -- ""
+    print -r -- "==================== trace copy ${run_no} ===================="
+    print -r -- "source: symbol"
+    print -r -- "file: $target_file"
+    print -r -- "symbol: $symbol"
+    print -r -- "lines: ${start_line}-${end_line}"
+    print -r -- "============================================================="
+    cat "$buffer_file"
+  } >> "$context_file"
+
+  copy_target="none"
+
+  if [[ -n "${TMUX:-}" ]] && command -v tmux >/dev/null 2>&1; then
+    tmux load-buffer "$context_file"
+    copy_target="tmux buffer"
+  elif command -v wl-copy >/dev/null 2>&1 && [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+    wl-copy < "$context_file"
+    copy_target="Wayland clipboard"
+  elif command -v xclip >/dev/null 2>&1 && [[ -n "${DISPLAY:-}" ]]; then
+    xclip -selection clipboard -in < "$context_file"
+    copy_target="X clipboard via xclip"
+  elif command -v pbcopy >/dev/null 2>&1; then
+    pbcopy < "$context_file"
+    copy_target="macOS clipboard"
+  fi
+
+  line_count=$(wc -l < "$buffer_file" | tr -d ' ')
+  trace_print_footer "$copy_target" "$context_file" "$line_count" "symbol:${symbol}"
+  rm -f "$tmp_color_file"
+  exit 0
+fi
+
+
+
+if [[ "${1:-}" == "--functions" ]]; then
+  shift
+
+  target="${1:-.}"
+  symbol="${2:-}"
+
+  buffer_dir="${TRACE_BUFFER_DIR:-$HOME/.cache/trace}"
+  buffer_file="${TRACE_BUFFER_FILE:-$buffer_dir/buffer.txt}"
+  context_file="${TRACE_CONTEXT_FILE:-$buffer_dir/context.txt}"
+  counter_file="${TRACE_COUNTER_FILE:-$buffer_dir/counter.txt}"
+
+  mkdir -p "$buffer_dir"
+  : > "$buffer_file"
+
+
+  python_outline_awk='
+    function flush(end_line) {
+      if (start > 0) {
+        len = end_line - start + 1
+
+        extra = ""
+        if (symbol != "" && hits != "") {
+          extra = " [" symbol ": " hits "]"
+        }
+
+        print file ":" start "-" end_line " [" len "L] " sig extra
+      }
+
+      start = 0
+      sig = ""
+      hits = ""
+    }
+
+    function add_hit(line_no, where) {
+      if (symbol == "") return
+
+      hit = where != "" ? where : line_no
+
+      if (hits == "") hits = hit
+      else hits = hits "," hit
+    }
+
+    function clean_sig(line) {
+      sub(/^[[:space:]]*/, "", line)
+      return line
+    }
+
+    /^[[:space:]]*(async[[:space:]]+)?def[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(/ {
+      flush(NR - 1)
+
+      start = NR
+      sig = clean_sig($0)
+
+      if (symbol != "" && sig ~ symbol) {
+        add_hit(NR, "signature")
+      }
+
+      next
+    }
+
+    start > 0 && symbol != "" && $0 ~ symbol {
+      add_hit(NR, "")
+    }
+
+    END {
+      flush(NR)
+    }
+  '
+
+  js_ts_outline_awk='
+    function trim(s) {
+      sub(/^[ \t]*/, "", s)
+      sub(/[ \t]*$/, "", s)
+      return s
+    }
+
+    function clean_sig(line) {
+      line = trim(line)
+      sub(/[ \t]*\{[ \t]*$/, "", line)
+      return line
+    }
+
+    function reset_lex_state() {
+      lex_block_comment = 0
+      lex_quote = ""
+      lex_escape = 0
+    }
+
+    function lexical_delta(s, open_char, close_char,    i, ch, next_ch, delta, squote) {
+      delta = 0
+      squote = sprintf("%c", 39)
+
+      for (i = 1; i <= length(s); i++) {
+        ch = substr(s, i, 1)
+        next_ch = substr(s, i + 1, 1)
+
+        if (lex_block_comment) {
+          if (ch == "*" && next_ch == "/") {
+            lex_block_comment = 0
+            i++
+          }
+          continue
+        }
+
+        if (lex_quote != "") {
+          if (lex_escape) {
+            lex_escape = 0
+            continue
+          }
+
+          if (ch == "\\") {
+            lex_escape = 1
+            continue
+          }
+
+          if (ch == lex_quote) {
+            lex_quote = ""
+          }
+
+          continue
+        }
+
+        if (ch == "/" && next_ch == "*") {
+          lex_block_comment = 1
+          i++
+          continue
+        }
+
+        if (ch == "/" && next_ch == "/") {
+          break
+        }
+
+        if (ch == "\"" || ch == squote || ch == "`") {
+          lex_quote = ch
+          lex_escape = 0
+          continue
+        }
+
+        if (ch == open_char) {
+          delta++
+        } else if (ch == close_char) {
+          delta--
+        }
+      }
+
+      return delta
+    }
+
+    function print_entry(start_line, end_line, signature,    len, extra) {
+      if (start_line <= 0 || end_line < start_line) {
+        return
+      }
+
+      len = end_line - start_line + 1
+
+      extra = ""
+      if (symbol != "" && hits != "") {
+        extra = " [" symbol ": " hits "]"
+      }
+
+      print file ":" start_line "-" end_line " [" len "L] " signature extra
+
+      hits = ""
+    }
+
+    function add_hit(line_no, where,    hit) {
+      if (symbol == "") {
+        return
+      }
+
+      hit = where != "" ? where : line_no
+
+      if (hits == "") {
+        hits = hit
+      } else {
+        hits = hits "," hit
+      }
+    }
+
+    function is_control_word(name) {
+      return name ~ /^(if|for|while|switch|catch|with|do|else|try|finally)$/
+    }
+
+    function is_named_function(line,    t) {
+      t = trim(line)
+
+      return t ~ /^(export[ \t]+)?(default[ \t]+)?(async[ \t]+)?function[ \t]+[A-Za-z_$][A-Za-z0-9_$]*[ \t]*\(/
+    }
+
+    function is_arrow_assignment_start(line,    t) {
+      t = trim(line)
+
+      return t ~ /^(export[ \t]+)?(const|let|var)[ \t]+[A-Za-z_$][A-Za-z0-9_$]*[ \t]*=/
+    }
+
+    function is_method_header(line,    t, prefix, count, parts, name) {
+      t = trim(line)
+
+      if (t == "" || t ~ /=>/) {
+        return 0
+      }
+
+      if (t !~ /\{[ \t]*$/ || t !~ /\(/ || t !~ /\)/) {
+        return 0
+      }
+
+      prefix = t
+      sub(/\(.*/, "", prefix)
+      prefix = trim(prefix)
+
+      if (prefix ~ /=/ || prefix ~ /\./) {
+        return 0
+      }
+
+      count = split(prefix, parts, /[ \t]+/)
+      name = parts[count]
+
+      if (name !~ /^[A-Za-z_$][A-Za-z0-9_$]*$/) {
+        return 0
+      }
+
+      if (is_control_word(name)) {
+        return 0
+      }
+
+      return 1
+    }
+
+    function find_function_body_start(start_line,    i, t) {
+      for (i = start_line; i <= NR && i <= start_line + 40; i++) {
+        t = trim(lines[i])
+
+        if (t ~ /\{[ \t]*$/) {
+          return i
+        }
+      }
+
+      return 0
+    }
+
+    function find_brace_end(start_line, first_text,    i, text, depth, seen) {
+      depth = 0
+      seen = 0
+      reset_lex_state()
+
+      for (i = start_line; i <= NR; i++) {
+        if (i == start_line && first_text != "") {
+          text = first_text
+        } else {
+          text = lines[i]
+        }
+        depth += lexical_delta(text, "{", "}")
+
+        if (index(text, "{") > 0) {
+          seen = 1
+        }
+
+        if (seen && depth <= 0) {
+          return i
+        }
+      }
+
+      return NR
+    }
+
+    function find_paren_end(start_line, first_text,    i, text, depth, seen) {
+      depth = 0
+      seen = 0
+      reset_lex_state()
+
+      for (i = start_line; i <= NR; i++) {
+        if (i == start_line && first_text != "") {
+          text = first_text
+        } else {
+          text = lines[i]
+        }
+
+        depth += lexical_delta(text, "(", ")")
+        if (index(text, "(") > 0) {
+          seen = 1
+        }
+
+        if (seen && depth <= 0) {
+          return i
+        }
+      }
+
+      return NR
+    }
+
+    function find_arrow_line(start_line,    i, t, balance) {
+      balance = 0
+      reset_lex_state()
+
+      for (i = start_line; i <= NR && i <= start_line + 40; i++) {
+        t = lines[i]
+
+        if (index(t, "=>") > 0) {
+          return i
+        }
+        balance += lexical_delta(t, "(", ")")
+        if (i == start_line && balance <= 0) {
+          return 0
+        }
+
+        if (i > start_line && balance <= 0) {
+          return 0
+        }
+      }
+
+      return 0
+    }
+
+    function find_arrow_end(arrow_line,    line, pos, tail, i, t) {
+      line = lines[arrow_line]
+      pos = index(line, "=>")
+
+      if (pos <= 0) {
+        return arrow_line
+      }
+
+      tail = trim(substr(line, pos + 2))
+      if (tail ~ /^\{/) {
+        return find_brace_end(arrow_line, tail)
+      }
+
+      if (tail ~ /^\(/) {
+        return find_paren_end(arrow_line, tail)
+      }
+
+      if (tail != "") {
+        return arrow_line
+      }
+
+      for (i = arrow_line + 1; i <= NR; i++) {
+        t = trim(lines[i])
+
+        if (t == "") {
+          continue
+        }
+
+        if (t ~ /^\{/) {
+          return find_brace_end(i, t)
+        }
+
+        if (t ~ /^\(/) {
+          return find_paren_end(i, t)
+        }
+
+        return i
+      }
+
+      return arrow_line
+    }
+
+    {
+      lines[NR] = $0
+    }
+
+    END {
+      i = 1
+
+      while (i <= NR) {
+        line = trim(lines[i])
+        start_line = 0
+        end_line = 0
+        signature = ""
+        hits = ""
+
+        if (is_named_function(line)) {
+          start_line = i
+          signature = clean_sig(lines[i])
+          body_line = find_function_body_start(i)
+
+          if (body_line > 0) {
+            end_line = find_brace_end(body_line, lines[body_line])
+          } else {
+            end_line = i
+          }
+        } else if (is_arrow_assignment_start(line)) {
+          arrow_line = find_arrow_line(i)
+          if (arrow_line > 0) {
+            start_line = i
+            signature = clean_sig(lines[i])
+            end_line = find_arrow_end(arrow_line)
+          }
+        } else if (is_method_header(line)) {
+          start_line = i
+          signature = clean_sig(lines[i])
+
+          end_line = find_brace_end(i, lines[i])
+        }
+
+        if (start_line > 0) {
+          if (symbol != "" && signature ~ symbol) {
+            add_hit(start_line, "signature")
+          }
+
+          print_entry(start_line, end_line, signature)
+
+          # Do not inspect executable statements inside the body as
+          # potential implementation owners.
+          i = end_line + 1
+          continue
+        }
+
+        i++
+      }
+    }
+  '
+  function_outline_awk='
+    function flush(end_line) {
+      if (start > 0) {
+        len = end_line - start + 1
+
+        extra = ""
+        if (symbol != "" && hits != "") {
+          extra = " [" symbol ": " hits "]"
+        }
+
+        print file ":" start "-" end_line " [" len "L] " sig extra
+      }
+
+      hits = ""
+    }
+
+    function add_hit(line_no, where) {
+      if (symbol == "") return
+
+      hit = where != "" ? where : line_no
+
+      if (hits == "") hits = hit
+      else hits = hits "," hit
+    }
+
+    function is_control_word(name) {
+      return name ~ /^(if|for|foreach|while|switch|catch|using|lock|fixed|checked|unchecked|else|try|finally|do)$/
+    }
+
+    function clean_sig(line) {
+      sub(/^[[:space:]]*/, "", line)
+      sub(/[[:space:]]*\{[[:space:]]*$/, "", line)
+      return line
+    }
+
+    function looks_like_function(line, tmp, first, before_paren, parts_count, parts) {
+      tmp = line
+      sub(/^[[:space:]]*/, "", tmp)
+
+      if (tmp !~ /\(/ || tmp !~ /\)/) return 0
+
+      first = tmp
+      sub(/[[:space:]]*\(.*/, "", first)
+      sub(/[[:space:]].*/, "", first)
+
+      if (is_control_word(first)) return 0
+
+      if (tmp ~ /^[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(.*\)[[:space:]]*\{?[[:space:]]*$/) return 1
+
+      if (tmp ~ /^(public|private|protected|internal|static|virtual|override|sealed|async|partial|extern|new)[[:space:]]+/) return 1
+
+      return 0
+    }
+    /^[[:space:]]*(export[[:space:]]+)?(async[[:space:]]+)?function[[:space:]]+[A-Za-z_$][A-Za-z0-9_$]*[[:space:]]*\(/ ||
+    /^[[:space:]]*(export[[:space:]]+)?(const|let|var)[[:space:]]+[A-Za-z_$][A-Za-z0-9_$]*[[:space:]]*=[[:space:]]*(async[[:space:]]*)?\(.*\)[[:space:]]*=>/ ||
+    /^[[:space:]]*(export[[:space:]]+)?(const|let|var)[[:space:]]+[A-Za-z_$][A-Za-z0-9_$]*[[:space:]]*=[[:space:]]*(async[[:space:]]*)?[A-Za-z_$][A-Za-z0-9_$]*[[:space:]]*=>/ ||
+    /^[[:space:]]*def[[:space:]]+[A-Za-z0-9_]+[[:space:]]*\(/ ||
+    looks_like_function($0) {
+
+      flush(NR - 1)
+
+      start = NR
+      sig = clean_sig($0)
+
+      if (symbol != "" && sig ~ symbol) {
+        add_hit(NR, "signature")
+      }
+
+      next
+    }
+
+    start > 0 && symbol != "" && $0 ~ symbol {
+      add_hit(NR, "")
+    }
+
+    END {
+      flush(NR)
+    }
+  '
+  ansible_outline_awk='
+    function trim(s) {
+      sub(/^[[:space:]]*/, "", s)
+      sub(/[[:space:]]*$/, "", s)
+      return s
+    }
+
+    function ansible_role_name(path, parts, i) {
+      n = split(path, parts, "/")
+
+      for (i = 1; i <= n; i++) {
+        if (parts[i] == "roles" && (i + 1) <= n) {
+          return parts[i + 1]
+        }
+      }
+
+      return ""
+    }
+
+    function flush(end_line) {
+      if (start > 0) {
+        len = end_line - start + 1
+
+        extra = ""
+        if (symbol != "" && hits != "") {
+          extra = " [" symbol ": " hits "]"
+        }
+
+        role = ansible_role_name(file)
+
+        if (role != "") {
+          print file ":" start "-" end_line " [" len "L] [ROLE: " role "] " sig extra
+        } else {
+          print file ":" start "-" end_line " [" len "L] " sig extra
+        }
+      }
+
+      start = 0
+      sig = ""
+      hits = ""
+    }
+
+    function add_hit(line_no, where) {
+      if (symbol == "") return
+
+      hit = where != "" ? where : line_no
+
+      if (hits == "") hits = hit
+      else hits = hits "," hit
+    }
+
+    /^[[:space:]]*-[[:space:]]+name:[[:space:]]*/ {
+      flush(NR - 1)
+
+      start = NR
+      line = $0
+      sub(/^[[:space:]]*-[[:space:]]+name:[[:space:]]*/, "", line)
+      gsub(/^["\047]|["\047]$/, "", line)
+
+      sig = "ansible task: " trim(line)
+
+      if (symbol != "" && sig ~ symbol) {
+        add_hit(NR, "signature")
+      }
+
+      next
+    }
+    start > 0 && symbol != "" && $0 ~ symbol {
+      add_hit(NR, "")
+    }
+
+    END {
+      flush(NR)
+    }
+  '
+
+  shell_outline_awk='
+    function trim(s) {
+      sub(/^[ \t]*/, "", s)
+      sub(/[ \t]*$/, "", s)
+      return s
+    }
+
+    function flush(end_line) {
+      if (start > 0) {
+        len = end_line - start + 1
+
+        extra = ""
+        if (symbol != "" && hits != "") {
+          extra = " [" symbol ": " hits "]"
+        }
+
+        print file ":" start "-" end_line " [" len "L] " sig extra
+      }
+
+      start = 0
+      sig = ""
+      hits = ""
+    }
+
+    function add_hit(line_no, where) {
+      if (symbol == "") return
+
+      hit = where != "" ? where : line_no
+
+      if (hits == "") hits = hit
+      else hits = hits "," hit
+    }
+
+    function is_shell_function(line) {
+      t = trim(line)
+
+      if (t ~ /^[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)[ \t]*(\{|$)/) return 1
+      if (t ~ /^function[ \t]+[A-Za-z_][A-Za-z0-9_]*([ \t]*\(\))?[ \t]*(\{|$)/) return 1
+
+      return 0
+    }
+
+    is_shell_function($0) {
+      flush(NR - 1)
+
+      start = NR
+      sig = trim($0)
+      sub(/[ \t]*\{[ \t]*$/, "", sig)
+
+      if (symbol != "" && sig ~ symbol) {
+        add_hit(NR, "signature")
+      }
+
+      next
+    }
+
+    start > 0 && symbol != "" && $0 ~ symbol {
+      add_hit(NR, "")
+    }
+
+    start > 0 && $0 ~ /^}[ \t]*(#.*)?$/ {
+      flush(NR)
+      next
+    }
+
+    END {
+      flush(NR)
+    }
+  '
+
+  files=()
+
+  if [[ -f "$target" ]]; then
+    files=("$target")
+  else
+    if [[ -d "$target" ]]; then
+      search_root="$target"
+      filter_symbol="$symbol"
+    else
+      search_root="."
+      filter_symbol="$target"
+    fi
+
+    while IFS= read -r file_path; do
+      files+=("$file_path")
+    done < <(
+      find "$search_root" \
+        \( -path '*/node_modules/*' -o \
+           -path '*/.git/*' -o \
+           -path '*/dist/*' -o \
+           -path '*/build/*' -o \
+           -path '*/coverage/*' -o \
+           -path '*/tmp/*' -o \
+           -path '*/vendor/*' -o \
+           -path '*/__pycache__/*' -o \
+           -path '*/.venv/*' -o \
+           -path '*/venv/*' -o \
+           -path '*/bin/*' -o \
+           -path '*/obj/*' \) \
+        -prune -o \
+        -type f \
+        \( -name '*.cs' -o \
+           -name '*.java' -o \
+           -name '*.js' -o \
+           -name '*.jsx' -o \
+           -name '*.ts' -o \
+           -name '*.tsx' -o \
+           -name '*.html' -o \
+           -name '*.py' -o \
+           -name '*.sh' -o \
+           -name '*.bash' -o \
+           -name '*.zsh' -o \
+           -name 'trace' -o \
+           -name '*.yml' -o \
+           -name '*.yaml' \) \
+        -print
+    )
+
+    symbol="$filter_symbol"
+  fi
+
+  if [[ "${#files[@]}" -eq 0 ]]; then
+    print -r -- "[trace] no function-capable files found for: $target" >&2
+    exit 1
+  fi
+  for function_file in "${files[@]}"; do
+    case "$function_file" in
+      *.py)
+        awk -v file="$function_file" -v symbol="$symbol" "$python_outline_awk" "$function_file" >> "$buffer_file"
+        ;;
+      *.js|*.jsx|*.ts|*.tsx)
+        awk -v file="$function_file" -v symbol="$symbol" "$js_ts_outline_awk" "$function_file" >> "$buffer_file"
+        ;;
+      *.yml|*.yaml)
+        awk -v file="$function_file" -v symbol="$symbol" "$ansible_outline_awk" "$function_file" >> "$buffer_file"
+        ;;
+      *.sh|*.bash|*.zsh|*/trace|trace)
+        awk -v file="$function_file" -v symbol="$symbol" "$shell_outline_awk" "$function_file" >> "$buffer_file"
+        ;;
+      *)
+        awk -v file="$function_file" -v symbol="$symbol" "$function_outline_awk" "$function_file" >> "$buffer_file"
+        ;;
+    esac
+  done
+  if [[ -n "$symbol" ]]; then
+    tmp_filtered_file="${buffer_file}.filtered.tmp"
+
+    grep -i -- "$symbol" "$buffer_file" > "$tmp_filtered_file" || true
+    mv "$tmp_filtered_file" "$buffer_file"
+  fi
+
+  if [[ ! -f "$context_file" ]]; then
+    : > "$context_file"
+  fi
+
+  if [[ ! -f "$counter_file" ]]; then
+    print -r -- "0" > "$counter_file"
+  fi
+
+  run_no="$(cat "$counter_file" 2>/dev/null || print -r -- 0)"
+  run_no=$((run_no + 1))
+  print -r -- "$run_no" > "$counter_file"
+
+  {
+    print -r -- ""
+    print -r -- "==================== trace copy ${run_no} ===================="
+    print -r -- "source: functions"
+    print -r -- "target: $target"
+    print -r -- "symbol: ${symbol:-<none>}"
+    print -r -- "============================================================="
+    cat "$buffer_file"
+  } >> "$context_file"
+
+  cat "$buffer_file"
+
+  copy_target="none"
+
+  if [[ -n "${TMUX:-}" ]] && command -v tmux >/dev/null 2>&1; then
+    tmux load-buffer "$context_file"
+    copy_target="tmux buffer"
+  elif command -v wl-copy >/dev/null 2>&1 && [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+    wl-copy < "$context_file"
+    copy_target="Wayland clipboard"
+  elif command -v xclip >/dev/null 2>&1 && [[ -n "${DISPLAY:-}" ]]; then
+    xclip -selection clipboard -in < "$context_file"
+    copy_target="X clipboard via xclip"
+  elif command -v pbcopy >/dev/null 2>&1; then
+    pbcopy < "$context_file"
+    copy_target="macOS clipboard"
+  fi
+
+  line_count=$(wc -l < "$buffer_file" | tr -d ' ')
+  byte_count=$(wc -c < "$buffer_file" | tr -d ' ')
+  context_lines=$(wc -l < "$context_file" | tr -d ' ')
+  context_bytes=$(wc -c < "$context_file" | tr -d ' ')
+
+  trace_print_footer "$copy_target" "$context_file" "$line_count" "functions:${target}"
+
+  exit 0
+fi
+
+
+if [[ "${1:-}" == "--snapshot" ]]; then
+  shift
+
+  snapshot_target="${1:-.}"
+
+  if [[ ! -e "$snapshot_target" ]]; then
+    print -r -- "[trace] snapshot target not found: $snapshot_target" >&2
+    exit 1
+  fi
+  buffer_dir="${TRACE_BUFFER_DIR:-$HOME/.cache/trace}"
+  buffer_file="${TRACE_BUFFER_FILE:-$buffer_dir/buffer.txt}"
+  context_file="${TRACE_CONTEXT_FILE:-$buffer_dir/context.txt}"
+  counter_file="${TRACE_COUNTER_FILE:-$buffer_dir/counter.txt}"
+
+  mkdir -p "$buffer_dir"
+  : > "$buffer_file"
+
+  files=()
+
+  if [[ -f "$snapshot_target" ]]; then
+    files=("$snapshot_target")
+  elif [[ -d "$snapshot_target" ]]; then
+    while IFS= read -r file_path; do
+      files+=("$file_path")
+    done < <(
+      find "$snapshot_target" \
+        \( -path '*/node_modules/*' -o \
+           -path '*/.git/*' -o \
+           -path '*/dist/*' -o \
+           -path '*/build/*' -o \
+           -path '*/coverage/*' -o \
+           -path '*/tmp/*' -o \
+           -path '*/vendor/*' -o \
+           -path '*/__pycache__/*' -o \
+           -path '*/.venv/*' -o \
+           -path '*/venv/*' -o \
+           -path '*/bin/*' -o \
+           -path '*/obj/*' \) \
+        -prune -o \
+        -type f \
+        \( -name '*.cs' -o \
+           -name '*.java' -o \
+           -name '*.js' -o \
+           -name '*.jsx' -o \
+           -name '*.ts' -o \
+           -name '*.tsx' -o \
+           -name '*.py' -o \
+           -name '*.sh' -o \
+           -name '*.bash' -o \
+           -name '*.zsh' -o \
+           -name 'trace' -o \
+           -name '*.html' -o \
+           -name '*.css' -o \
+           -name '*.scss' -o \
+           -name '*.json' -o \
+           -name '*.yaml' -o \
+           -name '*.yml' -o \
+           -name '*.toml' -o \
+           -name '*.ini' -o \
+           -name '*.conf' -o \
+           -name '*.env' -o \
+           -name '*.sql' -o \
+           -name '*.md' -o \
+           -name '*.txt' -o \
+           -name '*.rst' \) \
+        ! -name '*.min.js' \
+        ! -name '*.min.css' \
+        ! -name '*.map' \
+        ! -name '*.bundle.js' \
+        ! -name '*.chunk.js' \
+        ! -name '*.generated.*' \
+        ! -name '*bak*' \
+        ! -name '*.lock' \
+        -print
+    )
+  else
+    print -r -- "[trace] snapshot target is not a file or directory: $snapshot_target" >&2
+    exit 1
+  fi
+
+  if [[ "${#files[@]}" -eq 0 ]]; then
+    print -r -- "[trace] snapshot found no supported files: $snapshot_target" >&2
+    exit 1
+  fi
+  included_files=0
+  skipped_files=0
+  for snapshot_file in "${files[@]}"; do
+    if [[ ! -f "$snapshot_file" ]]; then
+      skipped_files=$((skipped_files + 1))
+      continue
+    fi
+
+    if ! grep -Iq . "$snapshot_file" 2>/dev/null; then
+      skipped_files=$((skipped_files + 1))
+      continue
+    fi
+    {
+      print -r -- ""
+      print -r -- "==================== FILE SNAPSHOT ===================="
+      print -r -- "file: $snapshot_file"
+      print -r -- "======================================================="
+      cat "$snapshot_file"
+    } >> "$buffer_file"
+
+    included_files=$((included_files + 1))
+  done
+
+  if (( included_files == 0 )); then
+    print -r -- "[trace] snapshot produced no readable files: $snapshot_target" >&2
+    exit 1
+  fi
+
+  if [[ ! -f "$context_file" ]]; then
+    : > "$context_file"
+  fi
+
+  if [[ ! -f "$counter_file" ]]; then
+    print -r -- "0" > "$counter_file"
+  fi
+
+  run_no="$(cat "$counter_file" 2>/dev/null || print -r -- 0)"
+  run_no=$((run_no + 1))
+  print -r -- "$run_no" > "$counter_file"
+
+  {
+    print -r -- ""
+    print -r -- "==================== trace copy ${run_no} ===================="
+    print -r -- "source: snapshot"
+    print -r -- "path: $snapshot_target"
+    print -r -- "files: $included_files"
+    print -r -- "skipped: $skipped_files"
+    print -r -- "============================================================="
+    cat "$buffer_file"
+  } >> "$context_file"
+
+  copy_target="none"
+
+  if [[ -n "${TMUX:-}" ]] && command -v tmux >/dev/null 2>&1; then
+    tmux load-buffer "$context_file"
+    copy_target="tmux buffer"
+  elif command -v wl-copy >/dev/null 2>&1 && [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+    wl-copy < "$context_file"
+    copy_target="Wayland clipboard"
+  elif command -v xclip >/dev/null 2>&1 && [[ -n "${DISPLAY:-}" ]]; then
+    xclip -selection clipboard -in < "$context_file"
+    copy_target="X clipboard via xclip"
+  elif command -v pbcopy >/dev/null 2>&1; then
+    pbcopy < "$context_file"
+    copy_target="macOS clipboard"
+  fi
+
+  line_count=$(wc -l < "$buffer_file" | tr -d ' ')
+  byte_count=$(wc -c < "$buffer_file" | tr -d ' ')
+
+  print -r -- "[trace] snapshot:"
+  print -r -- "  path    : $snapshot_target"
+  print -r -- "  files   : $included_files"
+  print -r -- "  skipped : $skipped_files"
+  print -r -- "  lines   : $line_count"
+  print -r -- "  size    : ${byte_count}B"
+
+  trace_print_footer "$copy_target" "$context_file" "$line_count" "snapshot:${snapshot_target}"
+
+  exit 0
+fi
+
+
+# Auto-detect real piped stdin.
+if [[ "${1:-}" == "--replace" ]]; then
+  shift
+
+  if [[ $# -ge 4 ]] \
+    && [[ "$1" =~ '^[0-9]+$' ]] \
+    && [[ "$2" =~ '^[0-9]+$' ]] \
+    && [[ -f "$3" ]]; then
+
+    start_line="$1"
+    end_line="$2"
+    target_file="$3"
+    shift 3
+    expected_label="${(j: :)@}"
+
+    trace_apply_replace_range "$start_line" "$end_line" "$target_file" "$expected_label"
+    exit 0
+  fi
+
+  if [[ $# -eq 2 ]] && [[ -f "$1" ]]; then
+    target_file="$1"
+    expected_label="$2"
+
+    case "$target_file" in
+      *.py)
+        resolved="$(trace_resolve_python_function_range "$target_file" "$expected_label")"
+        ;;
+      *.js|*.jsx|*.ts|*.tsx)
+        resolved="$(trace_resolve_js_ts_function_range "$target_file" "$expected_label")"
+        ;;
+      *.cs|*.java)
+        resolved="$(trace_resolve_csharp_function_range "$target_file" "$expected_label")"
+        ;;
+      *.yml|*.yaml)
+        resolved="$(trace_resolve_ansible_task_range "$target_file" "$expected_label")"
+        ;;
+      *)
+        print -r -- "[trace] --replace FILE SYMBOL does not support this file type yet: $target_file" >&2
+        print -r -- "[trace] use range mode:" >&2
+        print -r -- "  trace --replace <start> <end> <file> <expected-label>" >&2
+        exit 1
+        ;;
+    esac
+
+    case "$resolved" in
+      NONE)
+        print -r -- "[trace] symbol not found: $expected_label" >&2
+        exit 1
+        ;;
+      MULTIPLE)
+        print -r -- "[trace] multiple matches found: $expected_label" >&2
+        print -r -- "[trace] use range mode or a more specific file/symbol" >&2
+        exit 1
+        ;;
+    esac
+
+    start_line="${resolved%% *}"
+    end_line="${resolved##* }"
+
+    trace_apply_replace_range "$start_line" "$end_line" "$target_file" "$expected_label"
+    exit 0
+  fi
+
+  print -r -- "[trace] usage:" >&2
+  print -r -- "  trace --replace <file> <symbol-or-task-name>" >&2
+  print -r -- "  trace --replace <start> <end> <file> <expected-label>" >&2
+  exit 1
+fi
+
+# This avoids hanging on "cat > buffer_file" when stdin looks non-TTY
+# but no real data arrives.
+if [[ ! -t 0 ]]; then
+  if ! IFS= read -r -t 0.2 first_line; then
+    print -r -- "[trace] stdin looked piped but no data arrived; continuing with normal argument mode" >&2
+  else
+    if [[ $# -ge 1 ]]; then
+      label_parts=("$@")
+      label="${(j: :)label_parts}"
+    else
+      label="stdin"
+    fi
+
+    buffer_dir="${TRACE_BUFFER_DIR:-$HOME/.cache/trace}"
+    buffer_file="${TRACE_BUFFER_FILE:-$buffer_dir/buffer.txt}"
+    context_file="${TRACE_CONTEXT_FILE:-$buffer_dir/context.txt}"
+    counter_file="${TRACE_COUNTER_FILE:-$buffer_dir/counter.txt}"
+    mkdir -p "$buffer_dir"
+    : > "$buffer_file"
+
+    print -r -- "$first_line" > "$buffer_file"
+    cat >> "$buffer_file"
+
+    if [[ ! -f "$context_file" ]]; then
+      : > "$context_file"
+    fi
+
+    if [[ ! -f "$counter_file" ]]; then
+      print -r -- "0" > "$counter_file"
+    fi
+
+    run_no="$(cat "$counter_file" 2>/dev/null || print -r -- 0)"
+    run_no=$((run_no + 1))
+    print -r -- "$run_no" > "$counter_file"
+
+    {
+      print -r -- ""
+      print -r -- "==================== trace copy ${run_no} ===================="
+      print -r -- "source: stdin"
+      print -r -- "label: $label"
+      print -r -- "============================================================="
+      cat "$buffer_file"
+    } >> "$context_file"
+
+    copy_target="none"
+
+    if [[ -n "${TMUX:-}" ]] && command -v tmux >/dev/null 2>&1; then
+      tmux load-buffer "$context_file"
+      copy_target="tmux buffer"
+    elif command -v wl-copy >/dev/null 2>&1 && [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+      wl-copy < "$context_file"
+      copy_target="Wayland clipboard"
+    elif command -v xclip >/dev/null 2>&1 && [[ -n "${DISPLAY:-}" ]]; then
+      xclip -selection clipboard -in < "$context_file"
+      copy_target="X clipboard via xclip"
+    elif command -v pbcopy >/dev/null 2>&1; then
+      pbcopy < "$context_file"
+      copy_target="macOS clipboard"
+    fi
+
+    line_count=$(wc -l < "$buffer_file" | tr -d ' ')
+    context_lines=$(wc -l < "$context_file" | tr -d ' ')
+
+    print -r -- "[trace] copy ${run_no}: stdin ${line_count} lines; context ${context_lines} lines copied to ${copy_target}" >&2
+    exit 0
+  fi
+fi
+
+
+mode="smart"
+
+# Range extraction mode:
+# trace 500 635 file.cs "OptionalLabel"
+
+# if [[ $# -ge 3 ]] \
+#   && [[ "$1" =~ '^[0-9]+$' ]] \
+#   && [[ "$2" =~ '^[0-9]+$' ]] \
+#   && [[ -f "$3" ]]; then
+
+if [[ $# -ge 3 ]] \
+  && [[ "$1" =~ '^[0-9]+$' ]] \
+  && [[ "$2" =~ '^[0-9]+$' ]] \
+  && [[ -f "$3" ]]; then
+  start_line="$1"
+  end_line="$2"
+  target_file="$3"
+  if [[ $# -ge 4 ]]; then
+    label_parts=("${@:4}")
+    label="${(j: :)label_parts}"
+  else
+    symbol_name="$(trace_detect_symbol_name "$target_file" "$start_line")"
+
+    if [[ -n "$symbol_name" ]]; then
+      label="$symbol_name"
+    else
+      label="$(basename "$target_file"):$start_line-$end_line"
+    fi
+  fi
+
+
+  buffer_dir="${TRACE_BUFFER_DIR:-$HOME/.cache/trace}"
+  buffer_file="${TRACE_BUFFER_FILE:-$buffer_dir/buffer.txt}"
+  context_file="${TRACE_CONTEXT_FILE:-$buffer_dir/context.txt}"
+  counter_file="${TRACE_COUNTER_FILE:-$buffer_dir/counter.txt}"
+  tmp_color_file="${buffer_file}.color.tmp"
+
+  mkdir -p "$buffer_dir"
+  : > "$buffer_file"
+  : > "$tmp_color_file"
+
+  bat_cmd=""
+  if command -v bat >/dev/null 2>&1; then
+    bat_cmd="bat"
+  elif command -v batcat >/dev/null 2>&1; then
+    bat_cmd="batcat"
+  fi
+
+  if [[ -n "$bat_cmd" ]]; then
+    "$bat_cmd" \
+      --color=always \
+      --style=plain \
+      --paging=never \
+      --line-range "${start_line}:${end_line}" \
+      "$target_file" | tee "$tmp_color_file"
+
+    perl -pe 's/\e\[[0-9;]*m//g' "$tmp_color_file" > "$buffer_file"
+  else
+    sed -n "${start_line},${end_line}p" "$target_file" | tee "$buffer_file"
+  fi
+
+  if [[ ! -f "$context_file" ]]; then
+    : > "$context_file"
+  fi
+
+  if [[ ! -f "$counter_file" ]]; then
+    print -r -- "0" > "$counter_file"
+  fi
+
+  run_no="$(cat "$counter_file" 2>/dev/null || print -r -- 0)"
+  run_no=$((run_no + 1))
+  print -r -- "$run_no" > "$counter_file"
+
+  {
+    print -r -- ""
+    print -r -- "==================== trace copy ${run_no} ===================="
+    print -r -- "source: range"
+    print -r -- "file: $target_file"
+    print -r -- "lines: ${start_line}-${end_line}"
+    print -r -- "label: $label"
+    print -r -- "============================================================="
+    cat "$buffer_file"
+  } >> "$context_file"
+
+  copy_target="none"
+
+  if [[ -n "${TMUX:-}" ]] && command -v tmux >/dev/null 2>&1; then
+    tmux load-buffer "$context_file"
+    copy_target="tmux buffer"
+  elif command -v wl-copy >/dev/null 2>&1 && [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+    wl-copy < "$context_file"
+    copy_target="Wayland clipboard"
+  elif command -v xclip >/dev/null 2>&1 && [[ -n "${DISPLAY:-}" ]]; then
+    xclip -selection clipboard -in < "$context_file"
+    copy_target="X clipboard via xclip"
+  elif command -v pbcopy >/dev/null 2>&1; then
+    pbcopy < "$context_file"
+    copy_target="macOS clipboard"
+  fi
+
+  line_count=$(wc -l < "$buffer_file" | tr -d ' ')
+  byte_count=$(wc -c < "$buffer_file" | tr -d ' ')
+
+  trace_print_footer "$copy_target" "$context_file" "$line_count" "$label"
+  rm -f "$tmp_color_file"
+  exit 0
+ fi
+
+if [[ "${1:-}" == "--all" ]]; then
+  mode="all"
+  shift
+fi
+
+
+if [[ $# -lt 1 ]]; then
+  usage
+  exit 1
+fi
+
+pattern="$1"
+shift || true
+
+
+if [[ $# -gt 0 ]]; then
+  paths=("$@")
+else
+  paths=(.)
+fi
+
+buffer_dir="${TRACE_BUFFER_DIR:-$HOME/.cache/trace}"
+buffer_file="${TRACE_BUFFER_FILE:-$buffer_dir/buffer.txt}"          # latest result
+context_file="${TRACE_CONTEXT_FILE:-$buffer_dir/context.txt}"       # accumulated results
+counter_file="${TRACE_COUNTER_FILE:-$buffer_dir/counter.txt}"
+tmp_color_file="${buffer_file}.color.tmp"
+
+mkdir -p "$buffer_dir"
+
+
+cleanup() {
+  rm -f "$tmp_color_file"
+}
+trap cleanup EXIT
+
+
+: > "$buffer_file"
+: > "$tmp_color_file"
+
+if [[ ! -f "$context_file" ]]; then
+  : > "$context_file"
+fi
+
+if [[ ! -f "$counter_file" ]]; then
+  print -r -- "0" > "$counter_file"
+fi
+
+
+
+type_filters=()
+
+if [[ "$mode" == "smart" ]]; then
+     type_filters=(
+       --glob '**/*.{cs,js,jsx,ts,tsx,py,sh,bash,zsh}'
+       --glob '**/trace'
+       --glob '**/*.{html,css,scss}'
+       --glob '**/*.{json,yaml,yml,toml,ini,conf,env,sql}'
+       --glob '**/*.{md,txt,rst}'
+     )
+fi
+
+
+# if [[ "$mode" == "code" ]]; then
+#   type_filters=(
+#     --glob '**/*.cs'
+#     --glob '**/*.js'
+#     --glob '**/*.jsx'
+#     --glob '**/*.ts'
+#     --glob '**/*.tsx'
+#     --glob '**/*.py'
+#     --glob '**/*.sh'
+#   )
+# elif [[ "$mode" == "docs" ]]; then
+#   type_filters=(
+#     --glob '**/*.md'
+#     --glob '**/*.txt'
+#     --glob '**/*.rst'
+#   )
+# elif [[ "$mode" == "config" ]]; then
+#   type_filters=(
+#     --glob '**/*.json'
+#     --glob '**/*.yaml'
+#     --glob '**/*.yml'
+#     --glob '**/*.toml'
+#     --glob '**/*.ini'
+#     --glob '**/*.conf'
+#     --glob '**/*.env'
+#     --glob '**/*.sql'
+#   )
+# fi
+
+common_args=(
+  -n
+  --color always
+
+  # selected mode file types
+  "${type_filters[@]}"
+  # dirs
+  --glob '!**/node_modules/**'
+  --glob '!**/.git/**'
+  --glob '!**/dist/**'
+  --glob '!**/build/**'
+  --glob '!**/coverage/**'
+  --glob '!**/tmp/**'
+  --glob '!**/vendor/**'
+  --glob '!**/__pycache__/**'
+  --glob '!**/.venv/**'
+  --glob '!**/venv/**'
+  --glob '!**/bin/**'
+  --glob '!**/obj/**'
+  --glob '!**/runs/**'
+  --glob '!**/repos/**'
+  # files
+  --glob '!**/*.min.js'
+  --glob '!**/*.min.css'
+  --glob '!**/*.map'
+  --glob '!**/*.bundle.js'
+  --glob '!**/*.chunk.js'
+  --glob '!**/*.generated.*'
+  --glob '!**/*bak*'
+  --glob '!**/*.trace.bak.*'
+  --glob '!**/agent.log'
+  --glob '!**/events.jsonl'
+  --glob '!**/meta.json'
+  --glob '!**/final.json'
+  --glob '!**/deoplete.log'
+  --glob '!**/state.json'
+  --glob '!**/state.json.bak'
+  --glob '!**/*.lock'
+)
+
+set +e
+rg "${common_args[@]}" "$pattern" "${paths[@]}" | tee "$tmp_color_file"
+pipe_status=("${pipestatus[@]}")
+set -e
+
+rg_status="${pipe_status[1]:-${pipe_status[0]:-0}}"
+# Strip ANSI color codes before saving/copying.
+perl -pe 's/\e\[[0-9;]*m//g' "$tmp_color_file" > "$buffer_file"
+
+run_no="$(cat "$counter_file" 2>/dev/null || print -r -- 0)"
+run_no=$((run_no + 1))
+print -r -- "$run_no" > "$counter_file"
+
+{
+  print -r -- ""
+  print -r -- "==================== trace copy ${run_no} ===================="
+  print -r -- "pattern: $pattern"
+  print -r -- "mode: $mode"
+  print -r -- "path: ${paths[*]}"
+  print -r -- "============================================================="
+  cat "$buffer_file"
+} >> "$context_file"
+
+line_count=$(wc -l < "$buffer_file" | tr -d ' ')
+byte_count=$(wc -c < "$buffer_file" | tr -d ' ')
+
+if [[ "$rg_status" -eq 1 ]]; then
+  print -r -- "[trace] no matches. clean buffer saved: $buffer_file" >&2
+  exit 1
+elif [[ "$rg_status" -ne 0 ]]; then
+  print -r -- "[trace] rg failed with status $rg_status. clean buffer saved: $buffer_file" >&2
+  exit "$rg_status"
+fi
+
+copy_target="none"
+
+if [[ -n "${TMUX:-}" ]] && command -v tmux >/dev/null 2>&1; then
+  tmux load-buffer "$context_file"
+  copy_target="tmux buffer"
+elif command -v wl-copy >/dev/null 2>&1 && [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+  wl-copy < "$context_file"
+  copy_target="Wayland clipboard"
+elif command -v xclip >/dev/null 2>&1 && [[ -n "${DISPLAY:-}" ]]; then
+  xclip -selection clipboard -in < "$context_file"
+  copy_target="X clipboard via xclip"
+elif command -v pbcopy >/dev/null 2>&1; then
+  pbcopy < "$context_file"
+  copy_target="macOS clipboard"
+fi
+
+trace_print_footer "$copy_target" "$context_file" "$line_count" "$pattern"
