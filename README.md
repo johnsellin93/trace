@@ -11,7 +11,7 @@ Trace is a terminal investigation tool for AI-assisted debugging and codebase an
 
 Instead of dumping an entire repository, diff, log file, or frontend into an AI context window, Trace lets the model progressively request the exact evidence it needs.
 
-Trace combines repository search, function and symbol extraction, structured data inspection, version comparison, and clipboard/tmux workflows into a deterministic investigation loop.
+Trace combines repository search, function and symbol extraction, structured HTML/CSS inspection, JSON and YAML queries, version comparison, and clipboard/tmux workflows into a deterministic investigation loop.
 
 > The AI does not need the entire repository.
 > It needs the right evidence at the right time.
@@ -118,7 +118,7 @@ Trace executes the batch and accumulates the evidence:
 
 Paste the accumulated evidence back into the AI.
 
-The AI now has enough evidence to update its hypothesis and request the next batch.
+The AI updates its hypothesis and requests the next batch.
 
 ```text
 Problem
@@ -154,9 +154,22 @@ Find what changed that could explain the behavior.
 What Trace diff commands do you need?
 ```
 
-The AI determines which differences it needs to inspect.
+Trace supports repository/file comparison and symbol-level comparison.
 
-Typical investigation:
+```bash
+trace --diff /path/to/version-1 /path/to/version-2
+```
+
+Or compare only a specific implementation unit:
+
+```bash
+trace --diff-symbol \
+  version-1/grab_state.py \
+  version-2/grab_state.py \
+  build_state
+```
+
+The AI determines which differences it needs to inspect.
 
 ```text
 WORKING VERSION
@@ -174,9 +187,9 @@ BROKEN VERSION                           │
                                   root cause
 ```
 
-The model can request targeted `trace --diff ...` commands instead of requiring the entire repositories to be exported.
+The model does not need to ingest both repositories in their entirety.
 
-As evidence arrives, it can narrow the comparison:
+It can begin with repository-level change evidence and progressively narrow the investigation:
 
 ```text
 Repository-level changes
@@ -187,12 +200,14 @@ Changed functions
         ↓
 Changed conditions / state
         ↓
+Symbol-level comparison
+        ↓
 Behavioral difference
         ↓
 Regression cause
 ```
 
-This is useful when the most important fact is already known:
+This workflow is especially useful when the most important fact is already known:
 
 > **This version works. This version does not. What changed?**
 
@@ -200,14 +215,14 @@ This is useful when the most important fact is already known:
 
 ## 3. JSON / Log Investigation
 
-Large JSON logs often contain the evidence required to explain a failure, but sending the complete log to an AI wastes context and makes reasoning harder.
+Large JSON and JSONL logs often contain the evidence required to explain a failure, but sending the complete log to an AI wastes context and makes reasoning harder.
 
 Instead:
 
 ```text
 This run failed.
 
-The execution log is a large JSON document.
+The execution log is a large JSONL document.
 
 Determine why it failed.
 
@@ -217,28 +232,34 @@ What Trace jq queries do you need?
 The AI requests structured evidence:
 
 ```bash
-trace -jq '...'
-trace -jq '...'
-trace -jq '...'
+trace -jq events.jsonl \
+  'select(.round == 14) | {round,type,message}'
+```
+
+It can generate an entire batch:
+
+```bash
+trace -jq events.jsonl 'select(.type == "error")'
+trace -jq events.jsonl 'select(.round >= 12 and .round <= 16)'
+trace -jq events.jsonl 'select(.event == "patch") | {round,file,status}'
+trace -jq events.jsonl 'select(.status == "failed") | {round,type,message}'
 ```
 
 Each query extracts only the relevant structured records.
 
-The workflow becomes:
-
 ```text
-Large JSON log
-      ↓
+Large JSON / JSONL log
+          ↓
 AI defines jq evidence requests
-      ↓
+          ↓
 Trace executes targeted queries
-      ↓
+          ↓
 Small structured evidence set
-      ↓
+          ↓
 AI identifies suspicious state
-      ↓
+          ↓
 More specific jq queries
-      ↓
+          ↓
 Failure mechanism
 ```
 
@@ -266,57 +287,273 @@ The objective is not merely to make `jq` easier to run.
 
 The objective is to let the model decide **which structured evidence is actually necessary**.
 
+For direct object-path extraction:
+
+```bash
+trace --json-path config.json '.runtime.providers.openai'
+```
+
 ---
 
 ## 4. HTML / Frontend Investigation
 
-The same workflow can be applied to frontend problems.
+Frontend debugging is often spread across HTML structure, CSS selectors, JavaScript functions, DOM IDs, classes, and runtime state.
+
+Trace lets the AI request those structures directly.
+
+Start with the problem:
 
 ```text
-This UI element behaves incorrectly.
+The Cancel button sometimes remains disabled
+after an investigation finishes.
 
-Determine which HTML, JavaScript, CSS,
-symbols, or surrounding implementation
-you need to inspect.
+Determine why.
 
-Give me the Trace commands.
+Tell me which HTML, CSS, and JavaScript
+evidence you need.
 ```
 
-Trace can progressively acquire relevant frontend evidence instead of exporting the entire application.
+Instead of exporting the complete frontend, the AI can request a targeted batch:
+
+```bash
+trace --html-id grab-ui.html cancel-button
+trace --html-class grab-ui.html action-buttons
+trace --css grab-ui.html '#cancel-button'
+trace --symbol grab-ui.html renderRun
+trace --context 25 Cancel grab-ui.html
+trace --context 40 progress-label grab-ui.html
+```
+
+Trace supports several frontend-specific evidence types.
+
+### HTML ID
+
+Extract an element by its `id`:
+
+```bash
+trace --html-id grab-ui.html cancel-button
+```
+
+Conceptually:
+
+```html
+<button id="cancel-button">
+    Cancel
+</button>
+```
+
+becomes a directly addressable investigation unit.
+
+This is useful when the AI knows the DOM element involved but does not need the entire page.
+
+---
+
+### HTML Class
+
+Extract an element using a class:
+
+```bash
+trace --html-class grab-ui.html run-card
+```
+
+For example:
+
+```html
+<div class="run-card active">
+    ...
+</div>
+```
+
+The AI can request the structural block associated with that class rather than searching manually through the entire document.
+
+---
+
+### HTML Tag
+
+Inspect tag boundaries:
+
+```bash
+trace --html-tag grab-ui.html form
+trace --html-tag grab-ui.html button
+trace --html-tag grab-ui.html dialog
+```
+
+This is useful when structure matters but no stable ID or class exists.
+
+---
+
+### CSS Selector
+
+Extract the CSS block associated with a selector:
+
+```bash
+trace --css grab-ui.html '#cancel-button'
+trace --css grab-ui.html '.run-card'
+trace --css grab-ui.html '.progress-label'
+```
+
+This lets the AI investigate:
+
+```text
+HTML element
+      ↓
+class / ID
+      ↓
+CSS selector
+      ↓
+JavaScript handler
+      ↓
+state mutation
+      ↓
+frontend behavior
+```
+
+---
+
+### JavaScript Symbol
+
+HTML files often contain inline JavaScript.
+
+Trace can also retrieve the relevant JS function directly:
+
+```bash
+trace --symbol grab-ui.html renderRun
+```
+
+A frontend investigation can therefore combine multiple structural evidence types in a single batch:
+
+```bash
+trace --html-id grab-ui.html cancel-button
+trace --html-class grab-ui.html run-actions
+trace --css grab-ui.html '#cancel-button'
+trace --symbol grab-ui.html renderRun
+trace --symbol grab-ui.html cancelRun
+trace "disabled" grab-ui.html
+```
+
+The AI gets only the HTML, CSS, JavaScript, and state evidence associated with the behavior being investigated.
 
 ```text
 UI problem
     ↓
-HTML structure
+HTML ID / class
     ↓
-related JS functions
+DOM structure
     ↓
-selectors / event handlers
+CSS selector
     ↓
-related state
+JavaScript function
+    ↓
+state / event handler
     ↓
 behavioral cause
+```
+
+This makes frontend investigation follow the same Trace principle:
+
+> **Ask for the evidence associated with the behavior, not the entire application.**
+
+---
+
+## 5. Structured File Investigation
+
+Trace can address structured configuration and documentation directly.
+
+### JSON path
+
+```bash
+trace --json-path config.json '.providers.openai.model'
+```
+
+### YAML path
+
+```bash
+trace --yaml-path deployment.yml '.spec.template.spec.containers'
+```
+
+### Markdown heading
+
+```bash
+trace --heading README.md "Installation"
+```
+
+This gives the model another option besides line-oriented search.
+
+```text
+Structured document
+       ↓
+AI identifies relevant path / heading
+       ↓
+Trace extracts exact structure
+       ↓
+Evidence enters investigation context
 ```
 
 ---
 
 # Basic Commands
 
-| Command                     | Purpose                                                   |
-| --------------------------- | --------------------------------------------------------- |
-| `trace --clear`             | Reset the active investigation context                    |
-| `trace --tree`              | Capture repository structure                              |
-| `trace --functions .`       | Build a repository function index                         |
-| `trace --functions FILE`    | Build a function index for a file                         |
-| `trace PATTERN .`           | Search symbols, text, logs, configuration, and references |
-| `trace START END FILE NAME` | Extract an exact implementation range                     |
-| `trace --symbol ...`        | Acquire implementation by symbol                          |
-| `trace --diff ...`          | Investigate differences between versions                  |
-| `trace -jq ...`             | Extract structured JSON evidence                          |
+| Command                                   | Purpose                                                   |
+| ----------------------------------------- | --------------------------------------------------------- |
+| `trace --clear`                           | Reset the active investigation context                    |
+| `trace --tree`                            | Capture repository structure                              |
+| `trace --functions .`                     | Build a repository function index                         |
+| `trace --functions FILE`                  | Build a function index for a file                         |
+| `trace PATTERN .`                         | Search symbols, text, logs, configuration, and references |
+| `trace --context N PATTERN FILE`          | Extract surrounding context around matches                |
+| `trace START END FILE NAME`               | Extract an exact implementation range                     |
+| `trace --symbol FILE SYMBOL`              | Acquire implementation by symbol                          |
+| `trace --diff BEFORE AFTER`               | Compare files or repository versions                      |
+| `trace --diff-symbol BEFORE AFTER SYMBOL` | Compare one symbol across versions                        |
+| `trace -jq FILE FILTER`                   | Query JSON / JSONL with jq                                |
+| `trace --html-id FILE ID`                 | Extract an HTML element by ID                             |
+| `trace --html-class FILE CLASS`           | Extract an HTML element by class                          |
+| `trace --html-tag FILE TAG`               | Inspect HTML tag boundaries                               |
+| `trace --css FILE SELECTOR`               | Extract a CSS selector block                              |
+| `trace --json-path FILE PATH`             | Extract a JSON path                                       |
+| `trace --yaml-path FILE PATH`             | Extract a YAML path                                       |
+| `trace --heading FILE HEADING`            | Extract a Markdown section                                |
 
 Trace commands are designed to be generated in **batches**.
 
 Rather than manually asking for one piece of context at a time, the AI can request multiple related evidence items in one investigation round.
+
+---
+
+# Evidence Types
+
+Trace can acquire evidence at several levels:
+
+```text
+Repository
+    │
+    ├── tree
+    ├── file search
+    ├── function index
+    ├── symbols
+    ├── exact line ranges
+    │
+    ├── version diffs
+    │     └── symbol diffs
+    │
+    ├── HTML
+    │     ├── id
+    │     ├── class
+    │     └── tag
+    │
+    ├── CSS
+    │     └── selector
+    │
+    ├── structured data
+    │     ├── jq
+    │     ├── JSON path
+    │     └── YAML path
+    │
+    └── documentation
+          └── Markdown heading
+```
+
+The model chooses the evidence type according to the problem it is trying to solve.
 
 ---
 
@@ -338,8 +575,7 @@ server.py:96-110 [15L] def _get_client() -> str:
 server.py:111-121 [11L] def get_cloudflare_access_email() -> str:
 server.py:122-166 [45L] def _log_request_start():
 server.py:167-211 [45L] def _log_request_end(resp: Response):
-server.py:212-227 [16L] def _log_unhandled_exception(e: Exception):
-server.py:228-246 [19L] def _safe_float(x: Any) -> float:
+server.py:212-227 [16L] def _safe_float(x: Any) -> float:
 server.py:247-264 [18L] def _enqueue_all_trading_commands(bot_to_instance: dict, val: bool) -> int:
 server.py:265-269 [5L] def _line_key(bot_id: str, instance_id: str, line_id: str) -> Tuple[str, str, str]:
 server.py:270-303 [34L] def _coerce_nonneg_float(x: Any) -> float | None:
@@ -358,7 +594,7 @@ The AI can then use those coordinates to request exact implementation evidence.
 
 Trace maintains an accumulated investigation context.
 
-Every extraction adds evidence to the current investigation rather than replacing the previous result.
+Every successful extraction adds evidence to the current investigation rather than replacing the previous result.
 
 ```text
 Round 1
@@ -379,17 +615,65 @@ specific suspicious behavior
 Root cause
 ```
 
-This allows investigations to become progressively narrower.
+Different investigations can use completely different evidence sequences.
 
-Early commands establish where the problem might exist.
+A frontend problem might look like:
 
-Later commands test increasingly specific hypotheses.
+```text
+Problem
+   ↓
+HTML ID
+   ↓
+CSS selector
+   ↓
+JS symbol
+   ↓
+state mutation
+   ↓
+Root cause
+```
+
+A regression might look like:
+
+```text
+Problem
+   ↓
+repository diff
+   ↓
+changed file
+   ↓
+symbol diff
+   ↓
+surrounding implementation
+   ↓
+Root cause
+```
+
+A failed agent run might look like:
+
+```text
+Problem
+   ↓
+jq query
+   ↓
+suspicious round
+   ↓
+more targeted jq query
+   ↓
+controller symbol
+   ↓
+Root cause
+```
+
+The evidence mechanism changes.
+
+The investigation model remains the same.
 
 ---
 
-# Why Not Export the Entire Repository?
+# Why Not Export Everything?
 
-Large repositories contain substantial amounts of information unrelated to the problem being investigated.
+Large repositories, frontend files, logs, and structured data contain substantial amounts of information unrelated to the problem being investigated.
 
 Sending everything creates several problems:
 
@@ -398,6 +682,7 @@ Sending everything creates several problems:
 * models reason over unnecessary implementation detail
 * large logs overwhelm useful state transitions
 * repository snapshots become stale as investigations evolve
+* frontend files mix markup, styling, JavaScript, and unrelated components
 * missing evidence can still exist despite enormous prompts
 
 Trace instead treats context acquisition as part of the reasoning process.
@@ -405,7 +690,7 @@ Trace instead treats context acquisition as part of the reasoning process.
 ```text
 Do not ask:
 
-"What repository should I upload?"
+"What should I upload?"
 
 Ask:
 
@@ -423,6 +708,8 @@ AI-assisted debugging commonly breaks down because:
 * irrelevant files pollute the prompt
 * logs contain too much unrelated information
 * regressions span many changed files
+* frontend behavior crosses HTML, CSS, JavaScript, and state
+* structured configuration is difficult to inspect efficiently
 * the model must guess about code it cannot see
 
 Developers often compensate by:
@@ -440,7 +727,7 @@ Trace replaces that process with explicit, progressive evidence acquisition.
 
 # Why Trace Exists
 
-Large software systems distribute behavior across functions, files, services, configuration, logs, and versions.
+Large software systems distribute behavior across functions, files, services, configuration, logs, versions, HTML, CSS, and runtime state.
 
 The evidence necessary to explain a bug is rarely contained in a single file.
 
@@ -474,9 +761,18 @@ Trace
 Root cause
 ```
 
-Trace is not trying to replace `ripgrep`, `jq`, `git`, `sed`, or the Unix toolchain.
+Trace is not trying to replace:
 
-It coordinates them into an AI-directed investigation workflow.
+```text
+ripgrep
+git
+jq
+sed
+awk
+yq
+```
+
+It coordinates proven Unix tooling into an AI-directed investigation workflow.
 
 ---
 
@@ -568,17 +864,34 @@ Trace does not require an editor integration, but keyboard-driven workflows make
 
 ---
 
-# Supported Languages
+# Supported Languages and Formats
 
-Trace supports repository investigation across:
+Trace currently targets repository investigation across:
+
+### Source code
 
 * Python
 * C#
 * JavaScript
 * TypeScript
 * shell scripts
+
+### Infrastructure and configuration
+
 * YAML
 * Ansible
+* JSON
+* JSONL
+
+### Frontend
+
+* HTML
+* CSS
+* inline JavaScript
+
+### Documentation
+
+* Markdown
 
 The underlying investigation model is not language-specific:
 
@@ -610,6 +923,7 @@ Optional tools used by specific workflows:
 ```text
 git
 jq
+yq
 tree
 tmux
 wl-copy
@@ -660,6 +974,7 @@ Typical included content:
 * configuration
 * documentation
 * scripts
+* HTML and CSS
 * structured data
 
 Typical ignored content:
