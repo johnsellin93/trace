@@ -1,15 +1,15 @@
 #!/usr/bin/env zsh
 set -euo pipefail
 
-INSTALL_DIR="$HOME/grab"
+INSTALL_DIR="$HOME/trace"
 BIN_DIR="$HOME/.local/bin"
-WRAPPER_PATH="$BIN_DIR/grab"
-REPO_URL="https://github.com/johnsellin93/grab.git"
+WRAPPER_PATH="$BIN_DIR/trace"
+REPO_URL="https://github.com/johnsellin93/trace.git"
 
 PATH_EXPORT_LOCAL='export PATH="$HOME/.local/bin:$PATH"'
-PATH_EXPORT_GRAB='export PATH="$HOME/grab:$PATH"'
+PATH_EXPORT_TRACE='export PATH="$HOME/trace:$PATH"'
 
-info() { echo "[grab] $*"; }
+info() { echo "[trace] $*"; }
 ok() { echo "✓ $*"; }
 warn() { echo "⚠ $*"; }
 
@@ -58,7 +58,7 @@ ensure_required_dependency() {
     if has_cmd "$cmd"; then
         ok "$cmd installed"
     else
-        echo "[grab] ERROR: failed to install required dependency: $cmd" >&2
+        echo "[trace] ERROR: failed to install required dependency: $cmd" >&2
         exit 1
     fi
 }
@@ -80,7 +80,7 @@ ensure_optional_dependency() {
             warn "$cmd still not found"
         fi
     else
-        warn "$cmd not installed; grab will fall back where possible"
+        warn "$cmd not installed; trace will fall back where possible"
     fi
 }
 
@@ -110,7 +110,7 @@ if has_cmd wl-copy; then ok "wl-copy detected"; else warn "wl-copy not found"; f
 if has_cmd xclip; then ok "xclip detected"; else warn "xclip not found"; fi
 if has_cmd pbcopy; then ok "pbcopy detected"; else warn "pbcopy not found"; fi
 
-info "Installing grab..."
+info "Installing trace..."
 
 if [[ -d "$INSTALL_DIR/.git" ]]; then
     info "Existing installation found. Updating..."
@@ -119,7 +119,7 @@ else
     git clone "$REPO_URL" "$INSTALL_DIR"
 fi
 
-chmod +x "$INSTALL_DIR/grab"
+chmod +x "$INSTALL_DIR/trace"
 
 info "Installing wrapper..."
 
@@ -127,7 +127,7 @@ mkdir -p "$BIN_DIR"
 
 cat > "$WRAPPER_PATH" <<'EOF'
 #!/usr/bin/env bash
-exec zsh "$HOME/grab/grab" "$@"
+exec zsh "$HOME/trace/trace" "$@"
 EOF
 
 chmod +x "$WRAPPER_PATH"
@@ -147,5 +147,5 @@ echo "    source ~/.zshrc"
 echo
 info "Verify with:"
 echo
-echo "    grab --help"
-echo "    grab --functions ."
+echo "    trace --help"
+echo "    trace --functions ."
