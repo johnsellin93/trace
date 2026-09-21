@@ -1,9 +1,9 @@
 
 # Protocol
 
-Repository context is provided strictly through `grab`.
+Repository context is provided strictly through `trace`.
 
-The accumulated `grab` session is the **only source of truth**.
+The accumulated `trace` session is the **only source of truth**.
 
 Never assume code that has not been extracted.
 
@@ -33,20 +33,20 @@ Do not proceed to a later phase until the completion criteria of the current pha
 
 The assistant must determine whether the current request represents a continuation of the active investigation or the beginning of a new investigation.
 
-When beginning a **new investigation**, assistants **MUST** initialize a clean `grab` session.
+When beginning a **new investigation**, assistants **MUST** initialize a clean `trace` session.
 
 Use:
 
 ```bash
-grab --clear
-grab --functions .
+trace --clear
+trace --functions .
 ```
 
-Use `grab --tree` only when repository structure is unclear.
+Use `trace --tree` only when repository structure is unclear.
 
-The accumulated `grab` session represents the active investigation state.
+The accumulated `trace` session represents the active investigation state.
 
-Do **NOT** use `grab --clear` when continuing an existing investigation unless:
+Do **NOT** use `trace --clear` when continuing an existing investigation unless:
 
 * the user explicitly requests a reset;
 * the current accumulated context belongs to a different problem statement; or
@@ -61,11 +61,11 @@ There are two command classes.
 Use these when investigating, documenting, explaining, auditing, or understanding repository behavior.
 
 ```bash
-grab --functions .
-grab --tree
-grab START END FILE LABEL
-grab EXACT_PATTERN .
-grab --snapshot .
+trace --functions .
+trace --tree
+trace START END FILE LABEL
+trace EXACT_PATTERN .
+trace --snapshot .
 ```
 
 ### Modification Commands
@@ -73,13 +73,13 @@ grab --snapshot .
 Use these only when applying a completed replacement after sufficient evidence has been gathered.
 
 ```bash
-grab --replace FILE FUNCTION
-grab --replace START END FILE LABEL
+trace --replace FILE FUNCTION
+trace --replace START END FILE LABEL
 ```
 
-Assistants **MUST NOT** use `grab --replace` to inspect, read, extract, document, search, or gather evidence.
+Assistants **MUST NOT** use `trace --replace` to inspect, read, extract, document, search, or gather evidence.
 
-`grab --replace` is a write operation. It is only allowed during **PHASE 4 — MODIFICATION**.
+`trace --replace` is a write operation. It is only allowed during **PHASE 4 — MODIFICATION**.
 
 ---
 
@@ -94,13 +94,13 @@ Establish repository structure and discover investigation targets.
 If function boundaries are unknown, assistants **MUST** request:
 
 ```bash
-grab --functions .
+trace --functions .
 ```
 
 ### Rules
 
 1. Do not request range extractions before function indexing has been performed.
-2. Use `grab --tree` only when repository structure is unclear.
+2. Use `trace --tree` only when repository structure is unclear.
 3. Respond **ONLY** with a single copy-pasteable batch of evidence acquisition commands.
 
 ### Discovery Completion Criteria
@@ -142,7 +142,7 @@ After receiving a function index, assistants **MUST** identify:
 
 Respond **ONLY** with a single copy-pasteable batch of evidence acquisition commands.
 
-Do **NOT** include `grab --replace` commands during Phase 2.
+Do **NOT** include `trace --replace` commands during Phase 2.
 
 ---
 
@@ -162,7 +162,7 @@ If evidence is insufficient:
 ```text
 STOP.
 
-Request additional grab commands.
+Request additional trace commands.
 
 Do not generate code.
 ```
@@ -194,27 +194,25 @@ Propose complete replacements.
 ### Preferred Workflow
 
 ```bash
-grab --replace FILE FUNCTION
+trace --replace FILE FUNCTION
 ```
 
 Examples:
 
 ```bash
-grab --replace server.py _safe_float
-grab --replace lineflow.js showError
-grab --replace SampleLinesTrader.cs OnTick
-grab --replace roles/os_settings/tasks/main.yml "Render hardened sshd_config"
+trace --replace server.py _safe_float
+trace --replace lineflow.js showError
+trace --replace SampleLinesTrader.cs OnTick
 ```
 
 ### Fallback Workflow
 
 ```bash
-grab --replace START END FILE LABEL
+trace --replace START END FILE LABEL
 ```
 
-Never propose `grab --replace` as a way to fetch code.
 
-Before suggesting `grab --replace`, the assistant must already have:
+
 
 1. extracted the current target function or section;
 2. shown the full BEFORE code;
@@ -244,7 +242,6 @@ Before suggesting `grab --replace`, the assistant must already have:
 When the objective is documentation, explanation, auditing, or system understanding:
 
 * do not propose modifications;
-* do not use `grab --replace`;
 * continue evidence acquisition until the requested behavior can be explained comprehensively.
 
 ---
@@ -277,16 +274,16 @@ respond **ONLY** with:
 ### Example
 
 ```bash
-grab --functions .
+trace --functions .
 
-grab 2681 2780 lines18.cs OnStart
-grab 3023 3127 lines18.cs OnTick
-grab 982 1094 SampleLinesTrader.Python.cs PollCommandsAsync
-grab 1180 1213 SampleLinesTrader.Python.cs ShouldExecuteCommand
+trace 2681 2780 lines18.cs OnStart
+trace 3023 3127 lines18.cs OnTick
+trace 982 1094 SampleLinesTrader.Python.cs PollCommandsAsync
+trace 1180 1213 SampleLinesTrader.Python.cs ShouldExecuteCommand
 
-grab ExecuteOrder .
-grab OrderRetryLimit .
-grab "duplicate notification" .
+trace ExecuteOrder .
+trace OrderRetryLimit .
+trace "duplicate notification" .
 ```
 
 ---
