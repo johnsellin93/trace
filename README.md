@@ -7,7 +7,7 @@ Let your AI decide what evidence it needs.
 Use Trace to retrieve that evidence precisely.
 Keep investigating until the cause is proven.
 
-Trace is a terminal investigation tool for AI-assisted debugging and codebase analysis.
+Trace is a poweful terminal investigation tool for AI-assisted debugging and codebase analysis.
 
 Instead of dumping an entire repository, diff, log file, or frontend into an AI context window, Trace lets the model progressively request the exact evidence it needs.
 
