@@ -81,8 +81,25 @@ trace --symbol app.html renderRun
 trace --json-path config.json '.runtime.providers.openai'
 ```
 
-Instead of giving the model a multi-megabyte execution log, Trace can reduce it to the handful of events relevant to the current hypothesis.
+Instead of:
 
+```text
+5 MB JSON / JSONL log
+        ↓
+       AI
+```
+
+Trace can reduce it to:
+
+```text
+5 MB JSON / JSONL log
+        ↓
+targeted jq evidence
+        ↓
+20 useful records
+        ↓
+       AI
+```
 
 The evidence accumulates.
 
