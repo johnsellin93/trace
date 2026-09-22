@@ -245,35 +245,8 @@ behavioral cause
 
 ---
 
-## 4. Code Investigation
 
-For a codebase investigation, start by giving the model a lightweight function map:
-
-```bash
-trace --functions .
-```
-
-The model sees where functions live without loading every implementation.
-
-It can then generate a batch:
-
-```bash
-trace --symbol server.py process_request
-
-trace --symbol server.py retry_request
-
-trace --context 30 retry server.py
-
-trace "RetryLimit" .
-
-trace "duplicate request" .
-```
-
-A single investigation may involve **20–30 commands across several rounds** as the hypothesis changes.
-
----
-
-## 5. Structured File Investigation
+## 4. Structured File Investigation
 
 ```bash
 trace --json-path config.json '.providers.openai.model'
