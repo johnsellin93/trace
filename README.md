@@ -938,8 +938,8 @@ pbcopy
 The repository is currently hosted under the existing `grab` GitHub repository:
 
 ```bash
-git clone https://github.com/johnsellin93/grab.git
-cd grab
+git clone https://github.com/johnsellin93/trace.git
+cd trace
 chmod +x trace
 echo 'export PATH="$HOME/grab:$PATH"' >> ~/.zshrc
 source ~/.zshrc
