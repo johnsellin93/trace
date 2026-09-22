@@ -2,130 +2,72 @@
 
 **Your coding friend in the terminal.**
 
-Describe the problem.
-Let your AI decide what evidence it needs.
-Use Trace to retrieve that evidence precisely.
-Keep investigating until the cause is proven.
+## Version 1 works. Version 2 doesn't.
 
-Trace is a poweful terminal investigation tool for AI-assisted debugging and codebase analysis.
+Instead of opening files, comparing implementations, searching logs, and repeatedly assembling context for an AI, ask the model:
 
-Instead of dumping an entire repository, diff, log file, or frontend into an AI context window, Trace lets the model progressively request the exact evidence it needs.
+> Find what changed that could explain the regression.
+>
+> What Trace commands do you need?
 
-Trace combines repository search, function and symbol extraction, structured HTML/CSS inspection, JSON and YAML queries, version comparison, and clipboard/tmux workflows into a deterministic investigation loop.
+Trace can start with a repository-level diff:
 
-> The AI does not need the entire repository.
-> It needs the right evidence at the right time.
+```bash
+trace --diff version-1/ version-2/
+```
+
+Then narrow the investigation to a specific implementation:
+
+```bash
+trace --diff-symbol \
+  version-1/app_state.py \
+  version-2/app_state.py \
+  build_state
+```
+
+But Trace isn't really about running one command.
+
+A typical investigation can involve **20–30 small, targeted evidence requests**, often generated in batches.
+
+Each result changes what the model asks for next.
 
 ---
 
-# How Trace Works
-
-```text
-Problem statement + Function index
-      ↓
-AI decides what evidence it needs
-      ↓
-AI generates a batch of Trace commands
-      ↓
-Trace retrieves exact evidence
-      ↓
-Evidence accumulates in context
-      ↓
-AI updates its hypothesis
-      ↓
-More targeted Trace commands
-      ↓
-Root cause is proven
-      ↓
-Patch / recommendation
-```
-
-The workflow is iterative.
-
-The model does not have to guess which files might matter before the investigation starts.
-
-It asks for evidence as its understanding of the problem changes.
-
----
-
-# Investigation Workflows
-
-Trace is designed around real engineering problems rather than a single repository-search command.
-
-## 1. Code Investigation
-
-Start with a problem statement.
-
-```text
-Users occasionally receive duplicate notifications.
-
-We suspect retry handling might be involved,
-but we do not know which execution path causes it.
-
-What Trace commands do you need?
-```
-
-The AI can begin by requesting repository structure or function boundaries:
+## Give the AI a map before giving it the code
 
 ```bash
 trace --functions .
 ```
 
-It then receives exact function coordinates:
+Trace gives the model a lightweight map of **what functions exist and where they are** without loading all of their implementations.
 
-```text
-NotificationDispatcher.cs:312-383 ProcessNotificationDelivery
-NotificationDispatcher.cs:448-486 ShouldRetryNotification
-NotificationDispatcher.cs:521-564 RecordDeliveryAttempt
-NotificationDispatcher.cs:612-642 HasRecentSuccessfulDelivery
-
-RetryPolicy.cs:188-236 RetryFailedNotification
-RetryPolicy.cs:245-271 GetRetryBackoffDelay
-```
-
-The AI can now request a complete investigation batch:
+The model can then request only the evidence relevant to the problem:
 
 ```bash
-trace 312 383 NotificationDispatcher.cs ProcessNotificationDelivery
-trace 448 486 NotificationDispatcher.cs ShouldRetryNotification
-trace 521 564 NotificationDispatcher.cs RecordDeliveryAttempt
-trace 612 642 NotificationDispatcher.cs HasRecentSuccessfulDelivery
+trace --symbol version-2/app_state.py build_state
 
-trace 188 236 RetryPolicy.cs RetryFailedNotification
-trace 245 271 RetryPolicy.cs GetRetryBackoffDelay
+trace --symbol version-2/runner.py execute_run
 
-trace NotificationRetryLimit .
-trace DeliveryDeduplicationWindowMinutes .
-trace "duplicate notification" .
+trace -jq events.jsonl \
+  'select(.status == "failed") | {round,type,message}'
+
+trace --html-id app.html investigation-panel
+
+trace --css app.html ".run-card"
 ```
 
-Trace executes the batch and accumulates the evidence:
+The evidence accumulates.
 
-```text
-+72L  block   ProcessNotificationDelivery(...)
-+38L  block   ShouldRetryNotification(...)
-+44L  block   RecordDeliveryAttempt(...)
-+31L  block   HasRecentSuccessfulDelivery(...)
-+49L  block   RetryFailedNotification(...)
-+27L  block   GetRetryBackoffDelay(...)
-+18L  symbol  NotificationRetryLimit
-+13L  symbol  DeliveryDeduplicationWindowMinutes
-+26L  text    "duplicate notification"
+The model updates its hypothesis.
 
-[trace] +9 entries (+318L)
-→ context 807L / 64192B copied to clipboard
-```
-
-Paste the accumulated evidence back into the AI.
-
-The AI updates its hypothesis and requests the next batch.
+Then it asks for another batch.
 
 ```text
 Problem
    ↓
-Function index
+Function map
    ↓
-Investigation batch
+Batch of targeted evidence requests
    ↓
 Evidence
    ↓
@@ -136,357 +78,177 @@ More targeted evidence
 Root cause
 ```
 
----
-
-## 2. Regression / Version Investigation
-
-One of the strongest Trace workflows is investigating a regression between two versions.
-
-Start with the engineering problem rather than manually reading thousands of changed lines.
+An investigation might involve:
 
 ```text
-Version 1 works.
-
-Version 2 has a regression.
-
-Find what changed that could explain the behavior.
-
-What Trace diff commands do you need?
+Round 1
+repository diff + function map
+        ↓
+Round 2
+changed symbols + suspicious functions
+        ↓
+Round 3
+targeted log queries
+        ↓
+Round 4
+HTML / CSS / JavaScript evidence
+        ↓
+Round 5
+narrower implementation evidence
+        ↓
+Root cause
 ```
 
-Trace supports repository/file comparison and symbol-level comparison.
+**The AI doesn't need the entire repository.
+It needs the right evidence at the right time.**
+
+---
+
+# Investigation Workflows
+
+## 1. Regression / Version Investigation
+
+**Version 1 works. Version 2 doesn't. What changed?**
+
+Trace can compare entire repositories:
 
 ```bash
-trace --diff /path/to/version-1 /path/to/version-2
+trace --diff version-1/ version-2/
 ```
 
-Or compare only a specific implementation unit:
+Then progressively narrow the investigation:
 
 ```bash
 trace --diff-symbol \
-  version-1/grab_state.py \
-  version-2/grab_state.py \
+  version-1/app_state.py \
+  version-2/app_state.py \
   build_state
 ```
 
-The AI determines which differences it needs to inspect.
-
 ```text
-WORKING VERSION
-       │
-       ├────── Trace diff evidence ──────┐
-       │                                 │
-BROKEN VERSION                           │
-                                         ↓
-                               AI compares behavior
-                                         ↓
-                               candidate regression
-                                         ↓
-                           targeted symbol/function evidence
-                                         ↓
-                                  root cause
-```
-
-The model does not need to ingest both repositories in their entirety.
-
-It can begin with repository-level change evidence and progressively narrow the investigation:
-
-```text
-Repository-level changes
+Repository changes
         ↓
 Relevant changed files
         ↓
 Changed functions
         ↓
-Changed conditions / state
-        ↓
-Symbol-level comparison
+Symbol comparison
         ↓
 Behavioral difference
         ↓
 Regression cause
 ```
 
-This workflow is especially useful when the most important fact is already known:
-
-> **This version works. This version does not. What changed?**
-
 ---
 
-## 3. JSON / Log Investigation
+## 2. JSON / Log Investigation
 
-Large JSON and JSONL logs often contain the evidence required to explain a failure, but sending the complete log to an AI wastes context and makes reasoning harder.
+Large JSON and JSONL logs can contain millions of irrelevant fields and events.
 
-Instead:
-
-```text
-This run failed.
-
-The execution log is a large JSONL document.
-
-Determine why it failed.
-
-What Trace jq queries do you need?
-```
-
-The AI requests structured evidence:
+Instead of loading the entire log, let the model generate targeted queries:
 
 ```bash
 trace -jq events.jsonl \
-  'select(.round == 14) | {round,type,message}'
+  'select(.status == "failed") | {round,type,message}'
+
+trace -jq events.jsonl \
+  'select(.round >= 12 and .round <= 16)'
+
+trace -jq events.jsonl \
+  'select(.event == "patch") | {round,file,status}'
+
+trace -jq events.jsonl \
+  'select(.type == "error")'
 ```
 
-It can generate an entire batch:
-
-```bash
-trace -jq events.jsonl 'select(.type == "error")'
-trace -jq events.jsonl 'select(.round >= 12 and .round <= 16)'
-trace -jq events.jsonl 'select(.event == "patch") | {round,file,status}'
-trace -jq events.jsonl 'select(.status == "failed") | {round,type,message}'
-```
-
-Each query extracts only the relevant structured records.
+A model can request several queries in one batch, inspect the results, and generate more specific queries in the next round.
 
 ```text
 Large JSON / JSONL log
-          ↓
-AI defines jq evidence requests
-          ↓
-Trace executes targeted queries
-          ↓
-Small structured evidence set
-          ↓
-AI identifies suspicious state
-          ↓
-More specific jq queries
-          ↓
-Failure mechanism
-```
-
-Instead of:
-
-```text
-5 MB JSON
-    ↓
-AI
-```
-
-Trace provides:
-
-```text
-5 MB JSON
-    ↓
-targeted jq evidence
-    ↓
-20 useful records
-    ↓
-AI
-```
-
-The objective is not merely to make `jq` easier to run.
-
-The objective is to let the model decide **which structured evidence is actually necessary**.
-
-For direct object-path extraction:
-
-```bash
-trace --json-path config.json '.runtime.providers.openai'
+        ↓
+targeted jq batch
+        ↓
+small evidence set
+        ↓
+suspicious state
+        ↓
+more targeted queries
+        ↓
+failure mechanism
 ```
 
 ---
 
-## 4. HTML / Frontend Investigation
+## 3. HTML / Frontend Investigation
 
-Frontend debugging is often spread across HTML structure, CSS selectors, JavaScript functions, DOM IDs, classes, and runtime state.
+Frontend bugs often cross HTML, CSS, JavaScript, and application state.
 
-Trace lets the AI request those structures directly.
-
-Start with the problem:
-
-```text
-The Cancel button sometimes remains disabled
-after an investigation finishes.
-
-Determine why.
-
-Tell me which HTML, CSS, and JavaScript
-evidence you need.
-```
-
-Instead of exporting the complete frontend, the AI can request a targeted batch:
+The model can request all of those evidence types in the same investigation:
 
 ```bash
-trace --html-id grab-ui.html cancel-button
-trace --html-class grab-ui.html action-buttons
-trace --css grab-ui.html '#cancel-button'
-trace --symbol grab-ui.html renderRun
-trace --context 25 Cancel grab-ui.html
-trace --context 40 progress-label grab-ui.html
+trace --html-id app.html cancel-button
+
+trace --html-class app.html action-buttons
+
+trace --css app.html '#cancel-button'
+
+trace --symbol app.html renderRun
+
+trace --context 25 Cancel app.html
 ```
-
-Trace supports several frontend-specific evidence types.
-
-### HTML ID
-
-Extract an element by its `id`:
-
-```bash
-trace --html-id grab-ui.html cancel-button
-```
-
-Conceptually:
-
-```html
-<button id="cancel-button">
-    Cancel
-</button>
-```
-
-becomes a directly addressable investigation unit.
-
-This is useful when the AI knows the DOM element involved but does not need the entire page.
-
----
-
-### HTML Class
-
-Extract an element using a class:
-
-```bash
-trace --html-class grab-ui.html run-card
-```
-
-For example:
-
-```html
-<div class="run-card active">
-    ...
-</div>
-```
-
-The AI can request the structural block associated with that class rather than searching manually through the entire document.
-
----
-
-### HTML Tag
-
-Inspect tag boundaries:
-
-```bash
-trace --html-tag grab-ui.html form
-trace --html-tag grab-ui.html button
-trace --html-tag grab-ui.html dialog
-```
-
-This is useful when structure matters but no stable ID or class exists.
-
----
-
-### CSS Selector
-
-Extract the CSS block associated with a selector:
-
-```bash
-trace --css grab-ui.html '#cancel-button'
-trace --css grab-ui.html '.run-card'
-trace --css grab-ui.html '.progress-label'
-```
-
-This lets the AI investigate:
-
-```text
-HTML element
-      ↓
-class / ID
-      ↓
-CSS selector
-      ↓
-JavaScript handler
-      ↓
-state mutation
-      ↓
-frontend behavior
-```
-
----
-
-### JavaScript Symbol
-
-HTML files often contain inline JavaScript.
-
-Trace can also retrieve the relevant JS function directly:
-
-```bash
-trace --symbol grab-ui.html renderRun
-```
-
-A frontend investigation can therefore combine multiple structural evidence types in a single batch:
-
-```bash
-trace --html-id grab-ui.html cancel-button
-trace --html-class grab-ui.html run-actions
-trace --css grab-ui.html '#cancel-button'
-trace --symbol grab-ui.html renderRun
-trace --symbol grab-ui.html cancelRun
-trace "disabled" grab-ui.html
-```
-
-The AI gets only the HTML, CSS, JavaScript, and state evidence associated with the behavior being investigated.
 
 ```text
 UI problem
     ↓
-HTML ID / class
-    ↓
-DOM structure
+HTML element
     ↓
 CSS selector
     ↓
-JavaScript function
+JavaScript handler
     ↓
-state / event handler
+state mutation
     ↓
 behavioral cause
 ```
 
-This makes frontend investigation follow the same Trace principle:
+---
 
-> **Ask for the evidence associated with the behavior, not the entire application.**
+## 4. Code Investigation
+
+For a codebase investigation, start by giving the model a lightweight function map:
+
+```bash
+trace --functions .
+```
+
+The model sees where functions live without loading every implementation.
+
+It can then generate a batch:
+
+```bash
+trace --symbol server.py process_request
+
+trace --symbol server.py retry_request
+
+trace --context 30 retry server.py
+
+trace "RetryLimit" .
+
+trace "duplicate request" .
+```
+
+A single investigation may involve **20–30 commands across several rounds** as the hypothesis changes.
 
 ---
 
 ## 5. Structured File Investigation
 
-Trace can address structured configuration and documentation directly.
-
-### JSON path
-
 ```bash
 trace --json-path config.json '.providers.openai.model'
-```
 
-### YAML path
-
-```bash
 trace --yaml-path deployment.yml '.spec.template.spec.containers'
-```
 
-### Markdown heading
-
-```bash
 trace --heading README.md "Installation"
-```
-
-This gives the model another option besides line-oriented search.
-
-```text
-Structured document
-       ↓
-AI identifies relevant path / heading
-       ↓
-Trace extracts exact structure
-       ↓
-Evidence enters investigation context
 ```
 
 ---
@@ -935,8 +697,6 @@ pbcopy
 
 # Install
 
-The repository is currently hosted under the existing `grab` GitHub repository:
-
 ```bash
 git clone https://github.com/johnsellin93/trace.git
 cd trace
@@ -988,4 +748,3 @@ Typical ignored content:
 * generated artifacts
 
 ---
-
