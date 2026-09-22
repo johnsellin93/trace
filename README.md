@@ -737,16 +737,6 @@ echo 'export PATH="$HOME/trace:$PATH"' >> ~/.zshrc
 source ~/.zshrc
 ```
 
-Once the GitHub repository itself is renamed to `trace`, this becomes:
-
-```bash
-git clone https://github.com/johnsellin93/trace.git
-cd trace
-chmod +x trace
-echo 'export PATH="$HOME/trace:$PATH"' >> ~/.zshrc
-source ~/.zshrc
-```
-
 Verify:
 
 ```bash
