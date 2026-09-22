@@ -6,6 +6,8 @@
 
 Instead of opening files, comparing implementations, searching logs, and repeatedly assembling context for an AI, ask the model:
 
+
+
 > Find what changed that could explain the regression.
 >
 > What Trace commands do you need?
@@ -79,26 +81,6 @@ trace --symbol app.html renderRun
 
 # Inspect exact structured configuration
 trace --json-path config.json '.runtime.providers.openai'
-```
-
-Instead of:
-
-```text
-5 MB JSON / JSONL log
-        ↓
-       AI
-```
-
-Trace can reduce it to:
-
-```text
-5 MB JSON / JSONL log
-        ↓
-targeted jq evidence
-        ↓
-20 useful records
-        ↓
-       AI
 ```
 
 The evidence accumulates.
@@ -208,21 +190,26 @@ trace -jq events.jsonl \
 
 A model can request several queries in one batch, inspect the results, and generate more specific queries in the next round.
 
+
+Instead of:
+
 ```text
-Large JSON / JSONL log
+5 MB JSON / JSONL log
         ↓
-targeted jq batch
-        ↓
-small evidence set
-        ↓
-suspicious state
-        ↓
-more targeted queries
-        ↓
-failure mechanism
+       AI
 ```
 
----
+Trace can reduce it to:
+
+```text
+5 MB JSON / JSONL log
+        ↓
+targeted jq evidence
+        ↓
+20 useful records
+        ↓
+       AI
+```
 
 ## 3. HTML / Frontend Investigation
 
