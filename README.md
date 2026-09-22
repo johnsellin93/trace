@@ -989,20 +989,3 @@ Typical ignored content:
 
 ---
 
-# The Trace Philosophy
-
-Trace starts with a simple idea:
-
-> **Describe the problem first. Acquire evidence second.**
-
-You should not need to know every relevant file before asking an AI for help.
-
-The AI should be able to progressively determine what it needs to inspect.
-
-```text
-Describe.
-Trace.
-Reason.
-Repeat.
-Prove.
-```
