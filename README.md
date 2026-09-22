@@ -941,7 +941,7 @@ The repository is currently hosted under the existing `grab` GitHub repository:
 git clone https://github.com/johnsellin93/trace.git
 cd trace
 chmod +x trace
-echo 'export PATH="$HOME/grab:$PATH"' >> ~/.zshrc
+echo 'export PATH="$HOME/trace:$PATH"' >> ~/.zshrc
 source ~/.zshrc
 ```
 
