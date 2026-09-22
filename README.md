@@ -41,20 +41,48 @@ trace --functions .
 
 Trace gives the model a lightweight map of **what functions exist and where they are** without loading all of their implementations.
 
-The model can then request only the evidence relevant to the problem:
+With that map as a starting point, the model can generate a mixed batch of evidence requests across code, logs, frontend, and configuration:
 
 ```bash
+# Inspect suspicious implementations
 trace --symbol version-2/app_state.py build_state
-
 trace --symbol version-2/runner.py execute_run
 
+# Search around a suspicious behavior
+trace --context 30 retry version-2/runner.py
+
+# Find failures
 trace -jq events.jsonl \
-  'select(.status == "failed") | {round,type,message}'
+  'select(.status == "failed" or .type == "error") |
+   {round,event,type,file,status,message}'
 
+# Reconstruct the failure window
+trace -jq events.jsonl \
+  'select(
+     .round >= 12 and .round <= 16 and
+     (.type == "error" or .status == "failed" or .event == "patch")
+   ) |
+   {round,event,type,file,status,message}'
+
+# Search for likely failure mechanisms
+trace -jq events.jsonl \
+  'select(
+     (.message // "") |
+     test("timeout|rate limit|cached replay|validation failed"; "i")
+   ) |
+   {round,type,event,message}'
+
+# Inspect frontend structure and behavior
 trace --html-id app.html investigation-panel
-
 trace --css app.html ".run-card"
+trace --symbol app.html renderRun
+
+# Inspect exact structured configuration
+trace --json-path config.json '.runtime.providers.openai'
 ```
+
+Instead of giving the model a multi-megabyte execution log, Trace can reduce it to the handful of events relevant to the current hypothesis.
+
 
 The evidence accumulates.
 
