@@ -107,23 +107,6 @@ That keeps the loop simple: run a batch, paste the accumulated evidence back int
 
 For a faster keyboard-driven browser workflow, [Vimium C](https://github.com/gdh1995/vimium-c) works well alongside Trace.
 
-
-```text
-Problem
-   ↓
-Function map
-   ↓
-Batch of targeted evidence requests
-   ↓
-Evidence
-   ↓
-Updated hypothesis
-   ↓
-More targeted evidence
-   ↓
-Root cause
-```
-
 An investigation might involve:
 
 ```text
