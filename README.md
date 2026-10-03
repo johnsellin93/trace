@@ -37,13 +37,25 @@ Each result changes what the model asks for next.
 
 ## Give the AI a map before giving it the code
 
+Before loading implementations, let the model see what is available:
+
 ```bash
 trace --functions .
 ```
 
-Trace gives the model a lightweight map of **what functions exist and where they are** without loading all of their implementations.
-
+Trace builds a compact repository-wide function index showing which functions exist, which files they are in, and where their implementations are located.
 With that map as a starting point, the model can generate a mixed batch of evidence requests across code, logs, frontend, and configuration:
+
+For example:
+
+```
+app_state.py:120-168  build_state(...)
+runner.py:74-132      execute_run(...)
+server.py:411-458     cancel_run(...)
+```
+
+The model can use those locations as coordinates. Instead of loading entire files, it can choose the specific implementations that are relevant to the problem:
+
 
 ```bash
 # Inspect suspicious implementations
