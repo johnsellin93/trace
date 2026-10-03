@@ -27,6 +27,9 @@ trace --diff-symbol \
   build_state
 ```
 
+Every successful evidence-producing Trace command adds its result to the investigation and automatically copies the accumulated context to your clipboard.
+With Vimium C, the terminal → AI → terminal loop can be almost entirely keyboard-driven: run the batch, switch to the browser, paste the accumulated evidence, and continue.
+
 But Trace isn't really about running one command.
 
 A typical investigation can involve **20–30 small, targeted evidence requests**, often generated in batches.
