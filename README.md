@@ -53,9 +53,7 @@ app_state.py:120-168  build_state(...)
 runner.py:74-132      execute_run(...)
 server.py:411-458     cancel_run(...)
 ```
-
-The model can use those locations as coordinates. Instead of loading entire files, it can choose the specific implementations that are relevant to the problem:
-
+The model can use those locations as coordinates. Instead of loading entire files, it can choose the specific implementations that are relevant to the problem using the [Trace investigation protocol](PROTOCOL.md):
 
 ```bash
 # Inspect suspicious implementations
