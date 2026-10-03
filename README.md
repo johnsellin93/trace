@@ -89,11 +89,12 @@ The model updates its hypothesis.
 
 Then it asks for another batch.
 
-```
 Every successful evidence-producing Trace command adds its result to the investigation and automatically copies the accumulated context to your clipboard.
+
 That keeps the loop simple: run a batch, paste the accumulated evidence back into the AI, and continue.
-For a faster keyboard-driven browser workflow, Vimium C works well alongside Trace.
-```
+
+For a faster keyboard-driven browser workflow, [Vimium C](https://github.com/gdh1995/vimium-c) works well alongside Trace.
+
 
 ```text
 Problem
