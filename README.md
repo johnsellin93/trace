@@ -8,7 +8,7 @@ Instead of opening files, comparing implementations, searching logs, and repeate
 
 
 
-> Find what changed that could explain the regression.
+> Problem statement: Describe the issue you're investigating.
 >
 > What Trace commands do you need?
 
@@ -53,7 +53,9 @@ app_state.py:120-168  build_state(...)
 runner.py:74-132      execute_run(...)
 server.py:411-458     cancel_run(...)
 ```
-The model can use those locations as coordinates. Instead of loading entire files, it can choose the specific implementations that are relevant to the problem using the [Protocol](PROTOCOL.md):
+The model can use these locations as coordinates to investigate problems across the entire application, from backend functions and API calls to frontend JavaScript, HTML, CSS, configuration, and logs.
+
+Instead of loading entire files, it can extract only the relevant implementations and follow how different parts of the system interact using the [Protocol](PROTOCOL.md):
 
 ```bash
 # Inspect suspicious implementations
