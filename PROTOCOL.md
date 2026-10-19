@@ -1,4 +1,3 @@
-
 # Protocol
 
 Repository context is provided strictly through `trace`.
@@ -28,7 +27,6 @@ Do not proceed to a later phase until the completion criteria of the current pha
 
 ---
 
-
 ## Investigation Initialization
 
 The assistant must determine whether the current request represents a continuation of the active investigation or the beginning of a new investigation.
@@ -52,11 +50,11 @@ Do **NOT** use `trace --clear` when continuing an existing investigation unless:
 * the current accumulated context belongs to a different problem statement; or
 * the existing context is no longer relevant to the objective being investigated.
 
+---
+
 ## Command Safety Rules
 
-There are two command classes.
-
-### Evidence Acquisition Commands
+Trace commands are used for evidence acquisition.
 
 Use these when investigating, documenting, explaining, auditing, or understanding repository behavior.
 
@@ -66,20 +64,28 @@ trace --tree
 trace START END FILE LABEL
 trace EXACT_PATTERN .
 trace --snapshot .
+
+trace --symbol FILE SYMBOL
+trace --context N PATTERN FILE
+
+trace --diff BEFORE AFTER
+trace --diff-symbol BEFORE_FILE AFTER_FILE SYMBOL
+
+trace -jq FILE FILTER
+
+trace --html-id FILE ID
+trace --html-class FILE CLASS
+trace --html-tag FILE TAG
+trace --css FILE SELECTOR
+
+trace --json-path FILE PATH
+trace --yaml-path FILE PATH
+trace --heading FILE HEADING
 ```
 
-### Modification Commands
+Assistants **MUST NOT** modify source files during evidence acquisition.
 
-Use these only when applying a completed replacement after sufficient evidence has been gathered.
-
-```bash
-trace --replace FILE FUNCTION
-trace --replace START END FILE LABEL
-```
-
-Assistants **MUST NOT** use `trace --replace` to inspect, read, extract, document, search, or gather evidence.
-
-`trace --replace` is a write operation. It is only allowed during **PHASE 4 — MODIFICATION**.
+Source modifications belong exclusively to **PHASE 4 — MODIFICATION**.
 
 ---
 
@@ -142,7 +148,7 @@ After receiving a function index, assistants **MUST** identify:
 
 Respond **ONLY** with a single copy-pasteable batch of evidence acquisition commands.
 
-Do **NOT** include `trace --replace` commands during Phase 2.
+Do **NOT** include modification commands during Phase 2.
 
 ---
 
@@ -188,31 +194,11 @@ Propose complete replacements.
 ### Requirements
 
 * Preserve existing behavior unless explicitly instructed otherwise.
-* Prefer symbol-based replacements.
 * Prefer complete functions or sections over partial edits.
+* Base modifications strictly on verified source code.
+* Keep source modifications separate from Trace evidence acquisition.
 
-### Preferred Workflow
-
-```bash
-trace --replace FILE FUNCTION
-```
-
-Examples:
-
-```bash
-trace --replace server.py _safe_float
-trace --replace lineflow.js showError
-trace --replace SampleLinesTrader.cs OnTick
-```
-
-### Fallback Workflow
-
-```bash
-trace --replace START END FILE LABEL
-```
-
-
-
+Before proposing a replacement, assistants **MUST** have:
 
 1. extracted the current target function or section;
 2. shown the full BEFORE code;
@@ -290,4 +276,4 @@ trace "duplicate notification" .
 
 ## Objective
 
-Guide deterministic repository investigation, progressively acquire only the repository evidence necessary to solve the problem, and produce safe modifications based solely on the accumulated `grab` session.
+Guide deterministic repository investigation, progressively acquire only the repository evidence necessary to solve the problem, and produce safe modifications based solely on the accumulated `trace` session.
