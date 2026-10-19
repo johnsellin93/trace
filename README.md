@@ -2,7 +2,7 @@
 
 **Your coding friend in the terminal.**
 
-## Version 1 works. Version 2 doesn't.
+## Investigate any codebase, one piece of evidence at a time.
 
 Instead of opening files, comparing implementations, searching logs, and repeatedly assembling context for an AI, ask the model:
 
@@ -12,7 +12,7 @@ Instead of opening files, comparing implementations, searching logs, and repeate
 >
 > What Trace commands do you need?
 
-Trace can start with a repository-level diff:
+For example, if something worked in version 1 but broke in version 2, Trace can start by comparing the repositories:
 
 ```bash
 trace --diff version-1/ version-2/
