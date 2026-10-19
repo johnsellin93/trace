@@ -97,6 +97,7 @@ trace --symbol app.html renderRun
 trace --json-path config.json '.runtime.providers.openai'
 ```
 
+
 The evidence accumulates.
 
 The model updates its hypothesis.
@@ -138,6 +139,12 @@ Root cause
 
 **The AI doesn't need the entire repository.
 It needs the right evidence at the right time.**
+
+---
+
+## Quick Start
+
+Want to try Trace? Follow the [installation instructions](#install) to get started.
 
 ---
 
