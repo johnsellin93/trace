@@ -4,13 +4,15 @@
 
 ## Investigate any codebase, one piece of evidence at a time.
 
-Instead of opening files, comparing implementations, searching logs, and repeatedly assembling context for an AI, ask the model:
+Instead of manually searching through files, comparing implementations, and assembling context, let the AI decide what evidence it needs.
 
+Describe your problem and ask:
 
-
-> Problem statement: Describe the issue you're investigating.
+> **Problem statement:** Describe the issue you're investigating.
 >
 > What Trace commands do you need?
+
+The AI generates a batch of Trace commands based on your problem. You run them in your terminal, paste the accumulated evidence back into the conversation, and let the AI decide what to investigate next.
 
 For example, if something worked in version 1 but broke in version 2, Trace can start by comparing the repositories:
 
